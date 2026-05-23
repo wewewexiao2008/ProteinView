@@ -49,8 +49,8 @@ struct Cli {
     #[arg(long = "render", value_name = "MODE")]
     render_mode: Option<String>,
 
-    /// Color scheme: structure, element, chain, plddt, bfactor, rainbow
-    #[arg(long, default_value = "structure")]
+    /// Color scheme: plddt, structure, element, chain, bfactor, rainbow
+    #[arg(long, default_value = "plddt")]
     color: String,
 
     /// Visualization mode: cartoon, backbone, wireframe
@@ -525,18 +525,23 @@ fn main() -> Result<()> {
             },
         };
         let render_name = app.render_mode.name();
+        let (rot_x, rot_y, rot_z) = app.camera.euler_angles();
+        let m = app.camera.rotation_matrix();
         let state_json = format!(
-            "{{\n  \"focused_chain\": \"{}\",\n  \"viz_mode\": \"{}\",\n  \"color_scheme\": \"{}\",\n  \"render_mode\": \"{}\",\n  \"camera\": {{ \"rot_x\": {:.6}, \"rot_y\": {:.6}, \"rot_z\": {:.6}, \"zoom\": {:.6}, \"pan_x\": {:.6}, \"pan_y\": {:.6} }},\n  \"interface_active\": {},\n  \"show_interactions\": {},\n  \"show_ligands\": {},\n  \"auto_rotate\": {}\n}}\n",
+            "{{\n  \"focused_chain\": \"{}\",\n  \"viz_mode\": \"{}\",\n  \"color_scheme\": \"{}\",\n  \"render_mode\": \"{}\",\n  \"camera\": {{ \"rot_x\": {:.6}, \"rot_y\": {:.6}, \"rot_z\": {:.6}, \"zoom\": {:.6}, \"pan_x\": {:.6}, \"pan_y\": {:.6} }},\n  \"rotation_matrix\": [[{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}]],\n  \"interface_active\": {},\n  \"show_interactions\": {},\n  \"show_ligands\": {},\n  \"auto_rotate\": {}\n}}\n",
             focused_chain,
             viz_name,
             color_name,
             render_name,
-            app.camera.rot_x,
-            app.camera.rot_y,
-            app.camera.rot_z,
+            rot_x,
+            rot_y,
+            rot_z,
             app.camera.zoom,
             app.camera.pan_x,
             app.camera.pan_y,
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
             app.show_interface,
             app.show_interactions,
             app.show_ligands,
