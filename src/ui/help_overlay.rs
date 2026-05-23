@@ -94,10 +94,10 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::styled("  Space      ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle auto-rotation"),
         ]),
-        // Regions panel section.
+        // EditSpec panel section.
         Line::from(""),
         Line::from(Span::styled(
-            "  Regions Panel",
+            "  EditSpec Panel",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -121,6 +121,26 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  j / k      ", Style::default().fg(Color::Yellow)),
             Span::raw("Navigate regions"),
+        ]),
+        Line::from(vec![
+            Span::styled("  [ / ]      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch chain"),
+        ]),
+        Line::from(vec![
+            Span::styled("  y          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Yank selected range (e.g. A:51-80)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Y          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Yank selected sequence letters"),
+        ]),
+        Line::from(vec![
+            Span::styled("  u          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Undo last edit"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Ctrl+r     ", Style::default().fg(Color::Yellow)),
+            Span::raw("Redo last undo"),
         ]),
         // Edit mode section.
         Line::from(""),
@@ -153,38 +173,6 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  Tab (label)", Style::default().fg(Color::Yellow)),
             Span::raw("Cycle predefined labels"),
-        ]),
-        // Sequence panel section.
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Sequence Panel",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("  h / l      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Scroll sequence left / right"),
-        ]),
-        Line::from(vec![
-            Span::styled("  [ / ]      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Previous / next chain"),
-        ]),
-        Line::from(vec![
-            Span::styled("  click/drag ", Style::default().fg(Color::Yellow)),
-            Span::raw("Select residue range"),
-        ]),
-        Line::from(vec![
-            Span::styled("  y          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Yank range (e.g. A:51-80)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Y          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Yank sequence letters"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Clear selection"),
         ]),
         Line::from(""),
         Line::from(Span::styled(

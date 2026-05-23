@@ -42,20 +42,16 @@ impl LayoutMode {
 pub enum ActivePanel {
     None,
     Interface,
-    Regions,
+    EditSpec,
     Iteration,
-    ChainInfo,
-    Sequence,
 }
 
 impl ActivePanel {
     /// All panel variants in tab-cycle order (excluding None).
-    const PANELS: [ActivePanel; 5] = [
+    const PANELS: [ActivePanel; 3] = [
         ActivePanel::Interface,
-        ActivePanel::Regions,
+        ActivePanel::EditSpec,
         ActivePanel::Iteration,
-        ActivePanel::ChainInfo,
-        ActivePanel::Sequence,
     ];
 
     /// Advance to the next panel in the cycle.
@@ -87,8 +83,8 @@ impl ActivePanel {
         match self {
             Self::None => 0,
             Self::Interface => crate::ui::interface_panel::SIDEBAR_WIDTH,
-            Self::Regions | Self::Iteration | Self::ChainInfo => 34,
-            Self::Sequence => 60,
+            Self::EditSpec => 60,
+            Self::Iteration => 34,
         }
     }
 
@@ -96,7 +92,7 @@ impl ActivePanel {
     pub fn height(self) -> u16 {
         match self {
             Self::None => 0,
-            Self::Sequence => 14,
+            Self::EditSpec => 16,
             _ => 10,
         }
     }
@@ -106,10 +102,8 @@ impl ActivePanel {
         match self {
             Self::None => "None",
             Self::Interface => "Interface",
-            Self::Regions => "Regions",
+            Self::EditSpec => "EditSpec",
             Self::Iteration => "Iteration",
-            Self::ChainInfo => "ChainInfo",
-            Self::Sequence => "Sequence",
         }
     }
 }
@@ -1068,7 +1062,7 @@ impl App {
 
     /// Enter edit mode for an existing region (Enter key on a region).
     pub fn edit_region_start(&mut self) {
-        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return;
         }
         let regions = match self.annotation.as_ref().and_then(|a| a.editspec_regions.as_ref()) {
@@ -1092,9 +1086,9 @@ impl App {
         };
     }
 
-    /// Start adding a new region (a key in Regions panel).
+    /// Start adding a new region (a key in EditSpec panel).
     pub fn edit_region_add(&mut self) {
-        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return;
         }
         // Default chain is the first protein chain, or "A" if no chains.
@@ -1119,10 +1113,10 @@ impl App {
         };
     }
 
-    /// Delete the focused region (dd — double d confirmation).
+    /// Delete the focused region (dd -- double d confirmation).
     /// Returns true if the delete was executed (second 'd').
     pub fn edit_region_delete(&mut self) -> bool {
-        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return false;
         }
 
@@ -1164,9 +1158,9 @@ impl App {
         false
     }
 
-    /// Split the focused region at its midpoint (s key in Regions panel).
+    /// Split the focused region at its midpoint (s key in EditSpec panel).
     pub fn edit_region_split(&mut self) {
-        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return;
         }
 

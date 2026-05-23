@@ -84,9 +84,9 @@ struct Cli {
     annotation: Option<String>,
 }
 
-/// Handle key events when in Regions panel view mode (not editing).
+/// Handle key events when in EditSpec panel view mode (not editing).
 /// Returns true if the key was consumed.
-fn handle_regions_view_key(
+fn handle_editspec_view_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
 ) -> bool {
@@ -243,38 +243,13 @@ fn handle_edit_mode_key(
     }
 }
 
-/// Handle key events when in Sequence panel mode.
+/// Handle sequence-related keys in EditSpec panel (yank, scroll).
 /// Returns true if the key was consumed.
-fn handle_sequence_key(
+fn handle_editspec_sequence_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
 ) -> bool {
     match key.code {
-        // Horizontal scroll
-        KeyCode::Char('h') | KeyCode::Left => {
-            app.seq_h_scroll = app.seq_h_scroll.saturating_sub(5);
-            true
-        }
-        KeyCode::Char('l') | KeyCode::Right => {
-            let chain = app.protein.chains.get(app.current_chain);
-            let max_res = chain.map(|c| c.residues.len()).unwrap_or(0);
-            let max_scroll = max_res.saturating_sub(10) as u16;
-            app.seq_h_scroll = app.seq_h_scroll.saturating_add(5).min(max_scroll);
-            true
-        }
-        // Chain navigation
-        KeyCode::Char('[') => {
-            app.prev_chain();
-            app.seq_h_scroll = 0;
-            app.seq_selection.clear();
-            true
-        }
-        KeyCode::Char(']') => {
-            app.next_chain();
-            app.seq_h_scroll = 0;
-            app.seq_selection.clear();
-            true
-        }
         // y: yank selected range (e.g. "A:51-80")
         KeyCode::Char('y') => {
             if let Some((s, e)) = app.seq_selection.range() {
@@ -284,7 +259,7 @@ fn handle_sequence_key(
                         let seq_start = c.residues[s].seq_num;
                         let seq_end = c.residues[e].seq_num;
                         let text = format!("{}:{}-{}", c.id, seq_start, seq_end);
-                        ui::sequence_panel::yank_to_clipboard(&text);
+                        ui::editspec_panel::yank_to_clipboard(&text);
                     }
                 }
             }
@@ -295,13 +270,13 @@ fn handle_sequence_key(
             if let Some((s, e)) = app.seq_selection.range() {
                 let chain = app.protein.chains.get(app.current_chain);
                 if let Some(c) = chain {
-                    use ui::sequence_panel::aa_one_letter;
+                    use ui::editspec_panel::aa_one_letter;
                     let seq: String = c.residues[s..=e]
                         .iter()
                         .map(|r| aa_one_letter(&r.name))
                         .collect();
                     if !seq.is_empty() {
-                        ui::sequence_panel::yank_to_clipboard(&seq);
+                        ui::editspec_panel::yank_to_clipboard(&seq);
                     }
                 }
             }
@@ -351,8 +326,8 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            // Handle mouse drag for sequence panel selection
-            if app.active_panel == ActivePanel::Sequence && app.seq_selection.dragging {
+            // Handle mouse drag for sequence panel selection (within EditSpec)
+            if app.active_panel == ActivePanel::EditSpec && app.seq_selection.dragging {
                 if let Some(sidebar_rect) = app.last_sidebar_rect {
                     if me.column >= sidebar_rect.x
                         && me.column < sidebar_rect.x + sidebar_rect.width
@@ -396,7 +371,7 @@ fn max_panel_scroll(app: &App) -> u16 {
 fn handle_sidebar_click(
     app: &mut App,
     row: u16,
-    col: u16,
+    _col: u16,
     sidebar_rect: Rect,
     logfile: &mut Option<std::fs::File>,
 ) {
@@ -405,7 +380,7 @@ fn handle_sidebar_click(
     let item_row = row.saturating_sub(sidebar_rect.y).saturating_add(app.panel_scroll);
 
     match app.active_panel {
-        ActivePanel::Regions => {
+        ActivePanel::EditSpec => {
             let header = app.panel_click_header;
             if item_row >= header && app.panel_item_count > 0 {
                 let region_idx = (item_row - header) as usize;
@@ -413,44 +388,8 @@ fn handle_sidebar_click(
                     app.focused_region = region_idx;
                     log!(
                         logfile,
-                        "sidebar_click: panel=Regions region_idx={}",
+                        "sidebar_click: panel=EditSpec region_idx={}",
                         region_idx
-                    );
-                }
-            }
-        }
-        ActivePanel::ChainInfo => {
-            let header = app.panel_click_header;
-            if item_row >= header && app.panel_item_count > 0 {
-                let chain_idx = (item_row - header) as usize;
-                if chain_idx < app.panel_item_count {
-                    app.current_chain = chain_idx;
-                    log!(
-                        logfile,
-                        "sidebar_click: panel=ChainInfo chain_idx={}",
-                        chain_idx
-                    );
-                    if app.active_panel == ActivePanel::Interface {
-                        // Trigger interface color rebuild if needed
-                    }
-                }
-            }
-        }
-        ActivePanel::Sequence => {
-            // Mouse click in sequence panel: select residue at click position
-            let header = app.panel_click_header;
-            if item_row == header && app.panel_item_count > 0 {
-                // Clicked on the sequence line (header + 0 = sequence line)
-                let col_offset = col.saturating_sub(sidebar_rect.x) as usize;
-                let residue_idx = app.seq_h_scroll as usize + col_offset;
-                if residue_idx < app.panel_item_count {
-                    app.seq_selection.start = Some(residue_idx);
-                    app.seq_selection.end = Some(residue_idx);
-                    app.seq_selection.dragging = true;
-                    log!(
-                        logfile,
-                        "sidebar_click: panel=Sequence residue_idx={}",
-                        residue_idx
                     );
                 }
             }
@@ -708,22 +647,19 @@ fn main() -> Result<()> {
                 event::AppEvent::Key(key) => {
                     log!(logfile, "key: {:?}", key.code);
 
-                    // In Regions edit mode, intercept keys for field editing.
-                    if app.edit_state.editing && app.active_panel == ActivePanel::Regions {
+                    // In EditSpec edit mode, intercept keys for field editing.
+                    if app.edit_state.editing && app.active_panel == ActivePanel::EditSpec {
                         handle_edit_mode_key(&mut app, key);
                         continue;
                     }
 
-                    // In Regions panel view mode, handle edit operations.
-                    if app.active_panel == ActivePanel::Regions {
-                        if handle_regions_view_key(&mut app, key) {
+                    // In EditSpec panel view mode, handle edit operations.
+                    if app.active_panel == ActivePanel::EditSpec {
+                        if handle_editspec_view_key(&mut app, key) {
                             continue;
                         }
-                    }
-
-                    // In Sequence panel mode, handle sequence-specific keys.
-                    if app.active_panel == ActivePanel::Sequence {
-                        if handle_sequence_key(&mut app, key) {
+                        // Sequence-specific keys within EditSpec panel (yank, scroll).
+                        if handle_editspec_sequence_key(&mut app, key) {
                             continue;
                         }
                     }
@@ -890,8 +826,8 @@ fn main() -> Result<()> {
                                     interaction_counts,
                                 );
                             }
-                            ActivePanel::Regions => {
-                                ui::regions_panel::render_regions_panel(
+                            ActivePanel::EditSpec => {
+                                ui::editspec_panel::render_editspec_panel(
                                     frame,
                                     sidebar_area,
                                     &mut app,
@@ -902,20 +838,6 @@ fn main() -> Result<()> {
                                     frame,
                                     sidebar_area,
                                     &app,
-                                );
-                            }
-                            ActivePanel::ChainInfo => {
-                                ui::chain_info_panel::render_chain_info_panel(
-                                    frame,
-                                    sidebar_area,
-                                    &mut app,
-                                );
-                            }
-                            ActivePanel::Sequence => {
-                                ui::sequence_panel::render_sequence_panel(
-                                    frame,
-                                    sidebar_area,
-                                    &mut app,
                                 );
                             }
                             ActivePanel::None => unreachable!(),
@@ -951,8 +873,8 @@ fn main() -> Result<()> {
                                     interaction_counts,
                                 );
                             }
-                            ActivePanel::Regions => {
-                                ui::regions_panel::render_regions_panel(
+                            ActivePanel::EditSpec => {
+                                ui::editspec_panel::render_editspec_panel(
                                     frame,
                                     panel_area,
                                     &mut app,
@@ -963,20 +885,6 @@ fn main() -> Result<()> {
                                     frame,
                                     panel_area,
                                     &app,
-                                );
-                            }
-                            ActivePanel::ChainInfo => {
-                                ui::chain_info_panel::render_chain_info_panel(
-                                    frame,
-                                    panel_area,
-                                    &mut app,
-                                );
-                            }
-                            ActivePanel::Sequence => {
-                                ui::sequence_panel::render_sequence_panel(
-                                    frame,
-                                    panel_area,
-                                    &mut app,
                                 );
                             }
                             ActivePanel::None => unreachable!(),
