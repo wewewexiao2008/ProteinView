@@ -128,6 +128,19 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(" "));
         }
 
+        // Show mouse event count (debug indicator for mouse capture verification)
+        if app.mouse_event_count > 0 {
+            spans.push(Span::styled(
+                "\u{2502} ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                format!("mouse:{}", app.mouse_event_count),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
         let info = Paragraph::new(Line::from(spans));
         frame.render_widget(info, info_area);
     }

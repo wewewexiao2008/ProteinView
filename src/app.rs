@@ -150,11 +150,18 @@ pub struct SeqSelection {
     pub end: Option<usize>,
     /// Whether a mouse drag is in progress.
     pub dragging: bool,
+    /// Cursor position in the sequence (0-based residue index).
+    pub cursor: usize,
+    /// Whether the selection is active (user has explicitly selected residues).
+    pub active: bool,
 }
 
 impl SeqSelection {
     /// Return the inclusive range of selected residues, sorted.
     pub fn range(&self) -> Option<(usize, usize)> {
+        if !self.active {
+            return None;
+        }
         match (self.start, self.end) {
             (Some(s), Some(e)) => Some((s.min(e), s.max(e))),
             (Some(s), None) => Some((s, s)),
@@ -171,12 +178,112 @@ impl SeqSelection {
         }
     }
 
-    /// Clear the selection.
+    /// Clear the selection (but keep cursor position).
     pub fn clear(&mut self) {
         self.start = None;
         self.end = None;
         self.dragging = false;
+        self.active = false;
     }
+
+    /// Select a segment (contiguous residues with the same secondary structure)
+    /// starting from the given cursor position.
+    pub fn select_segment(&mut self, residues: &[crate::model::protein::Residue], cursor: usize) {
+        if residues.is_empty() || cursor >= residues.len() {
+            return;
+        }
+        self.cursor = cursor;
+        let (start, end) = find_segment(residues, cursor);
+        self.start = Some(start);
+        self.end = Some(end);
+        self.active = true;
+    }
+
+    /// Move the cursor by one residue and update the selection if active.
+    pub fn move_cursor(&mut self, residues: &[crate::model::protein::Residue], delta: i32) {
+        let max = if residues.is_empty() { 0 } else { residues.len() - 1 };
+        let new_pos = if delta > 0 {
+            self.cursor.saturating_add(delta as usize).min(max)
+        } else {
+            self.cursor.saturating_sub((-delta) as usize)
+        };
+        self.cursor = new_pos;
+        // If selection is active, move it to the new segment.
+        if self.active && !residues.is_empty() {
+            let (start, end) = find_segment(residues, self.cursor);
+            self.start = Some(start);
+            self.end = Some(end);
+        }
+    }
+
+    /// Expand or shrink the selection by one residue at the end boundary.
+    pub fn expand_end(&mut self, residues: &[crate::model::protein::Residue], delta: i32) {
+        let max = if residues.is_empty() { 0 } else { residues.len() - 1 };
+        if let Some(e) = self.end {
+            let new_end = if delta > 0 {
+                e.saturating_add(delta as usize).min(max)
+            } else {
+                e.saturating_sub((-delta) as usize)
+            };
+            self.end = Some(new_end);
+            self.active = true;
+        } else if !residues.is_empty() {
+            // No selection yet: select current cursor's segment first.
+            self.select_segment(residues, self.cursor);
+        }
+    }
+
+    /// Shrink or expand the selection by one residue at the start boundary.
+    pub fn expand_start(&mut self, residues: &[crate::model::protein::Residue], delta: i32) {
+        if let Some(s) = self.start {
+            let new_start = if delta > 0 {
+                s.saturating_add(delta as usize).min(self.end.unwrap_or(s))
+            } else {
+                s.saturating_sub((-delta) as usize)
+            };
+            self.start = Some(new_start);
+            self.active = true;
+        } else if !residues.is_empty() {
+            self.select_segment(residues, self.cursor);
+        }
+    }
+
+    /// Set cursor position and begin selection from a mouse click.
+    pub fn click(&mut self, residues: &[crate::model::protein::Residue], idx: usize) {
+        if idx < residues.len() {
+            self.cursor = idx;
+            self.select_segment(residues, idx);
+            self.dragging = false;
+        }
+    }
+
+    /// Extend selection during a mouse drag.
+    pub fn drag_to(&mut self, idx: usize, max: usize) {
+        let idx = idx.min(max.saturating_sub(1));
+        if self.start.is_none() {
+            self.start = Some(self.cursor);
+        }
+        self.end = Some(idx);
+        self.active = true;
+        self.dragging = true;
+    }
+}
+
+/// Find contiguous residues with the same secondary structure as the one at `cursor_idx`.
+fn find_segment(residues: &[crate::model::protein::Residue], cursor_idx: usize) -> (usize, usize) {
+    if residues.is_empty() || cursor_idx >= residues.len() {
+        return (0, 0);
+    }
+    let target_ss = residues[cursor_idx].secondary_structure;
+    let mut start = cursor_idx;
+    let mut end = cursor_idx;
+    while start > 0 && residues[start - 1].secondary_structure == target_ss {
+        start -= 1;
+    }
+    while end < residues.len() - 1 && residues[end + 1].secondary_structure == target_ss {
+        end += 1;
+    }
+    (start, end)
 }
 
 /// State for the inline region editor.
@@ -470,6 +577,11 @@ pub struct App {
     pub seq_h_scroll: u16,
     /// Selection state for the Sequence panel.
     pub seq_selection: SeqSelection,
+    /// Debug counter: total mouse events received (shown in statusbar when > 0).
+    pub mouse_event_count: u64,
+    /// Row (within the sidebar) where the sequence line is rendered.
+    /// Updated each frame by the editspec panel renderer for mouse hit-testing.
+    pub seq_line_row: u16,
 }
 
 impl App {
@@ -637,6 +749,8 @@ impl App {
             validation_issues: Vec::new(),
             seq_h_scroll: 0,
             seq_selection: SeqSelection::default(),
+            mouse_event_count: 0,
+            seq_line_row: 0,
         }
     }
 
@@ -1012,7 +1126,7 @@ impl App {
     }
 
     /// Re-run validation on the current region list and cache the results.
-    fn revalidate(&mut self) {
+    pub fn revalidate(&mut self) {
         self.validation_issues = self
             .annotation
             .as_ref()
@@ -1487,5 +1601,92 @@ impl App {
         self.edit_state = EditState::default();
         self.revalidate();
         true
+    }
+
+    /// Apply an action shortcut (keys 1-5) to the current sequence selection.
+    /// Creates a new region or modifies an existing one.
+    /// Returns a status message for display.
+    pub fn apply_action_shortcut(&mut self, action: &str) -> Option<String> {
+        let (start, end) = self.seq_selection.range()?;
+        let chain = self.protein.chains.get(self.current_chain)?;
+        let chain_id = chain.id.clone();
+        let seq_start = chain.residues.get(start)?.seq_num as usize;
+        let seq_end = chain.residues.get(end)?.seq_num as usize;
+
+        // Check if a region exactly covers this range on this chain.
+        let exact_match = self.annotation.as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .map(|regions| {
+                regions.iter().position(|r| {
+                    r.chain == chain_id && r.range[0] == seq_start && r.range[1] == seq_end
+                })
+            })
+            .flatten();
+
+        // Check for overlaps with existing regions.
+        let has_overlap = self.annotation.as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .map(|regions| {
+                regions.iter().any(|r| {
+                    r.chain == chain_id
+                        && r.range[1] >= seq_start
+                        && r.range[0] <= seq_end
+                        && !(r.range[0] == seq_start && r.range[1] == seq_end)
+                })
+            })
+            .unwrap_or(false);
+
+        if has_overlap {
+            return Some(format!("Overlap: selection {}:{}-{} overlaps existing region", chain_id, seq_start, seq_end));
+        }
+
+        self.push_history(&format!("action shortcut {}:{}-{} -> {}", chain_id, seq_start, seq_end, action));
+
+        // Ensure annotation structure exists.
+        if self.annotation.is_none() {
+            self.annotation = Some(Annotation {
+                editspec_regions: Some(Vec::new()),
+                iteration: None,
+                highlights: None,
+            });
+        }
+
+        if let Some(ref mut ann) = self.annotation {
+            if ann.editspec_regions.is_none() {
+                ann.editspec_regions = Some(Vec::new());
+            }
+            if let Some(ref mut regions) = ann.editspec_regions {
+                if let Some(idx) = exact_match {
+                    // Modify existing region's action.
+                    let old_action = regions[idx].action.clone();
+                    regions[idx].action = action.to_string();
+                    Some(format!("Changed region {} [{}-{}] action: {} -> {}",
+                        chain_id, seq_start, seq_end, old_action, action))
+                } else {
+                    // Create new region.
+                    let sym = match action {
+                        "keep" => "=",
+                        "edit" => "~",
+                        "replace" => ">",
+                        "insert" => "+",
+                        "delete" => "-",
+                        _ => "?",
+                    };
+                    regions.push(EditSpecRegion {
+                        chain: chain_id.clone(),
+                        range: [seq_start, seq_end],
+                        action: action.to_string(),
+                        label: None,
+                    });
+                    self.focused_region = regions.len() - 1;
+                    Some(format!("Created {} region {}:{}-{}",
+                        sym, chain_id, seq_start, seq_end))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 }

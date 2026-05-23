@@ -563,8 +563,15 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                     let start_res = h_scroll;
                     let end_res = (start_res + residues_per_line).min(res_count);
 
+                    // Track the sequence line row for mouse hit-testing
+                    app.seq_line_row = (lines.len() as u16).saturating_sub(app.panel_scroll);
+
                     if start_res < res_count {
-                        // Sequence line with action coloring
+                        // Get selection range for highlighting
+                        let sel_range = app.seq_selection.range();
+                        let cursor_idx = app.seq_selection.cursor;
+
+                        // Sequence line with action coloring + selection/cursor highlighting
                         let mut seq_spans: Vec<Span> = Vec::new();
                         for (i, residue) in residues.iter().enumerate() {
                             if i < start_res || i >= end_res {
@@ -574,7 +581,7 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
 
                             // Determine action color
                             let action = action_map.get(&residue.seq_num);
-                            let fg = match action.map(|s| s.as_str()).unwrap_or("") {
+                            let base_fg = match action.map(|s| s.as_str()).unwrap_or("") {
                                 "keep" => Color::Rgb(0, 200, 80),
                                 "edit" => Color::Rgb(255, 200, 0),
                                 "replace" => Color::Rgb(255, 80, 80),
@@ -583,10 +590,35 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                                 _ => Color::White,
                             };
 
-                            seq_spans.push(Span::styled(
-                                letter.to_string(),
-                                Style::default().fg(fg),
-                            ));
+                            // Check if this residue is selected
+                            let is_selected = sel_range
+                                .map(|(s, e)| i >= s && i <= e)
+                                .unwrap_or(false);
+                            let is_cursor = i == cursor_idx;
+
+                            if is_selected {
+                                // Selected: reverse video (colored background)
+                                seq_spans.push(Span::styled(
+                                    letter.to_string(),
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(base_fg)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
+                            } else if is_cursor {
+                                // Cursor only (not selected): underline
+                                seq_spans.push(Span::styled(
+                                    letter.to_string(),
+                                    Style::default()
+                                        .fg(base_fg)
+                                        .add_modifier(Modifier::UNDERLINED),
+                                ));
+                            } else {
+                                seq_spans.push(Span::styled(
+                                    letter.to_string(),
+                                    Style::default().fg(base_fg),
+                                ));
+                            }
                         }
                         if !seq_spans.is_empty() {
                             lines.push(Line::from(seq_spans));
@@ -636,18 +668,48 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                             lines.push(Line::from(act_spans));
                         }
 
-                        // Scroll hint
+                        // Selection info and scroll hint
+                        let sel_info = if let Some((s, e)) = sel_range {
+                            let seq_start = residues[s].seq_num;
+                            let seq_end = residues[e].seq_num;
+                            format!(" sel:{}:{}-{} ", chain_id, seq_start, seq_end)
+                        } else {
+                            String::new()
+                        };
+
                         if res_count > residues_per_line {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    " h/l:scroll [{}/{}] y/Y:copy",
-                                    start_res + 1,
-                                    res_count
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    sel_info,
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
                                 ),
-                                Style::default().fg(Color::DarkGray),
-                            )));
+                                Span::styled(
+                                    format!(
+                                        " [{}/{}] h/l:nav H/L:sel 1-5:act y/Y:copy",
+                                        start_res + 1,
+                                        res_count
+                                    ),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]));
+                        } else if !sel_info.is_empty() {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    sel_info,
+                                    Style::default()
+                                        .fg(Color::Cyan)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    " h/l:nav H/L:sel 1-5:act y/Y:copy",
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]));
                         }
                     } else {
+                        app.seq_line_row = 0;
                         lines.push(Line::from(Span::styled(
                             " Scroll back with h",
                             Style::default().fg(Color::DarkGray),
@@ -655,18 +717,21 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                     }
                 }
             } else {
+                app.seq_line_row = 0;
                 lines.push(Line::from(Span::styled(
                     " No residues",
                     Style::default().fg(Color::DarkGray),
                 )));
             }
         } else {
+            app.seq_line_row = 0;
             lines.push(Line::from(Span::styled(
                 " Not a protein chain",
                 Style::default().fg(Color::DarkGray),
             )));
         }
     } else {
+        app.seq_line_row = 0;
         lines.push(Line::from(Span::styled(
             " No chain selected",
             Style::default().fg(Color::DarkGray),

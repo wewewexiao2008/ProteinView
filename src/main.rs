@@ -245,13 +245,59 @@ fn handle_edit_mode_key(
     }
 }
 
-/// Handle sequence-related keys in EditSpec panel (yank, scroll).
+/// Handle sequence-related keys in EditSpec panel (selection, yank, action shortcuts).
 /// Returns true if the key was consumed.
 fn handle_editspec_sequence_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
+    logfile: &mut Option<std::fs::File>,
 ) -> bool {
+    let residues = app.protein.chains.get(app.current_chain)
+        .map(|c| &c.residues[..])
+        .unwrap_or(&[]);
+
     match key.code {
+        // Left / h: move cursor left by 1 residue
+        KeyCode::Left | KeyCode::Char('h') => {
+            if !residues.is_empty() {
+                app.seq_selection.move_cursor(residues, -1);
+                // Auto-scroll to keep cursor visible
+                let cursor = app.seq_selection.cursor;
+                if cursor < app.seq_h_scroll as usize {
+                    app.seq_h_scroll = cursor as u16;
+                }
+            }
+            true
+        }
+        // Right / l: move cursor right by 1 residue
+        KeyCode::Right | KeyCode::Char('l') => {
+            if !residues.is_empty() {
+                app.seq_selection.move_cursor(residues, 1);
+                // Auto-scroll to keep cursor visible
+                if let Some(sidebar) = app.last_sidebar_rect {
+                    let visible = sidebar.width.saturating_sub(2) as usize;
+                    let cursor = app.seq_selection.cursor;
+                    if cursor >= app.seq_h_scroll as usize + visible {
+                        app.seq_h_scroll = cursor.saturating_sub(visible.saturating_sub(1)) as u16;
+                    }
+                }
+            }
+            true
+        }
+        // Alt+Left / H: shrink selection from the left (move start boundary right)
+        KeyCode::Char('H') => {
+            if !residues.is_empty() {
+                app.seq_selection.expand_start(residues, 1);
+            }
+            true
+        }
+        // Alt+Right / L: expand selection at the right boundary
+        KeyCode::Char('L') => {
+            if !residues.is_empty() {
+                app.seq_selection.expand_end(residues, 1);
+            }
+            true
+        }
         // y: yank selected range (e.g. "A:51-80")
         KeyCode::Char('y') => {
             if let Some((s, e)) = app.seq_selection.range() {
@@ -284,6 +330,47 @@ fn handle_editspec_sequence_key(
             }
             true
         }
+        // 1-5: action shortcuts (create/modify region with action)
+        KeyCode::Char('1') => {
+            if let Some(msg) = app.apply_action_shortcut("keep") {
+                app.edit_state.validation_error = None;
+                log!(logfile, "action shortcut: {}", msg);
+            }
+            app.revalidate();
+            true
+        }
+        KeyCode::Char('2') => {
+            if let Some(msg) = app.apply_action_shortcut("edit") {
+                app.edit_state.validation_error = None;
+                log!(logfile, "action shortcut: {}", msg);
+            }
+            app.revalidate();
+            true
+        }
+        KeyCode::Char('3') => {
+            if let Some(msg) = app.apply_action_shortcut("replace") {
+                app.edit_state.validation_error = None;
+                log!(logfile, "action shortcut: {}", msg);
+            }
+            app.revalidate();
+            true
+        }
+        KeyCode::Char('4') => {
+            if let Some(msg) = app.apply_action_shortcut("insert") {
+                app.edit_state.validation_error = None;
+                log!(logfile, "action shortcut: {}", msg);
+            }
+            app.revalidate();
+            true
+        }
+        KeyCode::Char('5') => {
+            if let Some(msg) = app.apply_action_shortcut("delete") {
+                app.edit_state.validation_error = None;
+                log!(logfile, "action shortcut: {}", msg);
+            }
+            app.revalidate();
+            true
+        }
         // Escape: clear selection
         KeyCode::Esc => {
             app.seq_selection.clear();
@@ -295,12 +382,14 @@ fn handle_editspec_sequence_key(
 
 /// Handle mouse events for sidebar interaction.
 fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::fs::File>) {
+    app.mouse_event_count += 1;
     log!(
         logfile,
-        "mouse: kind={:?} row={} col={}",
+        "mouse: kind={:?} row={} col={} (total={})",
         me.kind,
         me.row,
-        me.column
+        me.column,
+        app.mouse_event_count
     );
     match me.kind {
         MouseEventKind::ScrollUp => {
@@ -373,7 +462,7 @@ fn max_panel_scroll(app: &App) -> u16 {
 fn handle_sidebar_click(
     app: &mut App,
     row: u16,
-    _col: u16,
+    col: u16,
     sidebar_rect: Rect,
     logfile: &mut Option<std::fs::File>,
 ) {
@@ -383,6 +472,28 @@ fn handle_sidebar_click(
 
     match app.active_panel {
         ActivePanel::EditSpec => {
+            // Check if click is in the sequence area (on or after the sequence line)
+            let seq_row = app.seq_line_row;
+            if seq_row > 0 && item_row == seq_row {
+                // Click on the sequence line: select the residue at this column.
+                let col_offset = col.saturating_sub(sidebar_rect.x) as usize;
+                let residue_idx = app.seq_h_scroll as usize + col_offset;
+                let chain = app.protein.chains.get(app.current_chain);
+                if let Some(c) = chain {
+                    if residue_idx < c.residues.len() {
+                        app.seq_selection.click(&c.residues, residue_idx);
+                        log!(
+                            logfile,
+                            "seq_click: residue_idx={} segment=({:?})",
+                            residue_idx,
+                            app.seq_selection.range()
+                        );
+                    }
+                }
+                return;
+            }
+
+            // Otherwise, check region list clicks
             let header = app.panel_click_header;
             if item_row >= header && app.panel_item_count > 0 {
                 let region_idx = (item_row - header) as usize;
@@ -514,6 +625,15 @@ fn main() -> Result<()> {
         picker.protocol_type(),
         picker.font_size()
     );
+
+    // Re-enable raw mode after Picker::from_query_stdio().
+    // The picker internally calls enable_raw_mode()/disable_raw_mode() to query
+    // the terminal, which can leave the terminal in a non-raw state on some
+    // systems.  Re-establishing raw mode here ensures crossterm's event reader
+    // receives proper input (including mouse escape sequences).
+    disable_raw_mode()?;
+    enable_raw_mode()?;
+    log!(logfile, "raw mode re-enabled after picker query");
 
     // Parse CLI color scheme override
     let color_override = match cli.color.to_ascii_lowercase().as_str() {
@@ -661,7 +781,7 @@ fn main() -> Result<()> {
                             continue;
                         }
                         // Sequence-specific keys within EditSpec panel (yank, scroll).
-                        if handle_editspec_sequence_key(&mut app, key) {
+                        if handle_editspec_sequence_key(&mut app, key, &mut logfile) {
                             continue;
                         }
                     }
