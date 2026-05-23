@@ -115,6 +115,19 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(" "));
         }
 
+        // Show Python bridge status
+        if !app.python_available {
+            spans.push(Span::styled(
+                "\u{2502} ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.push(Span::styled(
+                "No-Python",
+                Style::default().fg(Color::Rgb(255, 165, 0)),
+            ));
+            spans.push(Span::raw(" "));
+        }
+
         let info = Paragraph::new(Line::from(spans));
         frame.render_widget(info, info_area);
     }

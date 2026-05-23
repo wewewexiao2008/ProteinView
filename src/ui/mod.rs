@@ -5,5 +5,6 @@ pub mod helpbar;
 pub mod interface_panel;
 pub mod iteration_panel;
 pub mod regions_panel;
+pub mod sequence_panel;
 pub mod statusbar;
 pub mod viewport;

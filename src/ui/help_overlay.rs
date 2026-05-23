@@ -6,12 +6,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 /// Render a centered help overlay
 pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
-    // Center the popup — guard against tiny terminals
+    // Center the popup -- guard against tiny terminals
     if area.width < 10 || area.height < 10 {
         return;
     }
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 23u16.min(area.height.saturating_sub(4));
+    let popup_height = 40u16.min(area.height.saturating_sub(4));
     let x = (area.width - popup_width) / 2;
     let y = (area.height - popup_height) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -94,13 +94,97 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::styled("  Space      ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle auto-rotation"),
         ]),
+        // Regions panel section.
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Regions Panel",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(vec![
-            Span::styled("  ?          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle this help"),
+            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Edit focused region"),
         ]),
         Line::from(vec![
-            Span::styled("  q          ", Style::default().fg(Color::Yellow)),
-            Span::raw("Quit"),
+            Span::styled("  a          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Add new region"),
+        ]),
+        Line::from(vec![
+            Span::styled("  dd         ", Style::default().fg(Color::Yellow)),
+            Span::raw("Delete focused region"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Split region at midpoint"),
+        ]),
+        Line::from(vec![
+            Span::styled("  j / k      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Navigate regions"),
+        ]),
+        // Edit mode section.
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Edit Mode",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  Tab / j    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Next field"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+Tab / k", Style::default().fg(Color::Yellow)),
+            Span::raw("Previous field"),
+        ]),
+        Line::from(vec![
+            Span::styled("  +/- / h/l  ", Style::default().fg(Color::Yellow)),
+            Span::raw("Adjust value / cycle option"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Save changes"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Cancel edit"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab (label)", Style::default().fg(Color::Yellow)),
+            Span::raw("Cycle predefined labels"),
+        ]),
+        // Sequence panel section.
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Sequence Panel",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  h / l      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Scroll sequence left / right"),
+        ]),
+        Line::from(vec![
+            Span::styled("  [ / ]      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Previous / next chain"),
+        ]),
+        Line::from(vec![
+            Span::styled("  click/drag ", Style::default().fg(Color::Yellow)),
+            Span::raw("Select residue range"),
+        ]),
+        Line::from(vec![
+            Span::styled("  y          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Yank range (e.g. A:51-80)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Y          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Yank sequence letters"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Clear selection"),
         ]),
         Line::from(""),
         Line::from(Span::styled(

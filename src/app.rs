@@ -1,7 +1,12 @@
 use std::sync::mpsc;
 
+use ratatui::style::Color;
 use ratatui_image::picker::Picker;
 
+use crate::bridge::GemlibBridge;
+use crate::edit_history::{
+    EditHistory, HistoryEntry, ValidationIssue, validate_regions,
+};
 use crate::model::interface::{InterfaceAnalysis, analyze_binding_pockets, analyze_interface};
 use crate::model::protein::Protein;
 use crate::render::camera::Camera;
@@ -12,6 +17,26 @@ use crate::render::ribbon::{RibbonTriangle, generate_ribbon_mesh};
 /// optimizations (background interface analysis, backbone default, reduced LOD).
 pub const LARGE_STRUCTURE_THRESHOLD: usize = 5000;
 
+/// Layout orientation based on terminal aspect ratio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Wide terminal (aspect > 1.5): sidebar left + main right.
+    Horizontal,
+    /// Narrow/tall terminal (aspect <= 1.5): main top + panel bottom.
+    Vertical,
+}
+
+impl LayoutMode {
+    /// Compute layout mode from terminal dimensions.
+    pub fn from_size(cols: u16, rows: u16) -> Self {
+        if cols as f32 / rows as f32 > 1.5 {
+            LayoutMode::Horizontal
+        } else {
+            LayoutMode::Vertical
+        }
+    }
+}
+
 /// Which sidebar panel is active (if any).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivePanel {
@@ -20,15 +45,17 @@ pub enum ActivePanel {
     Regions,
     Iteration,
     ChainInfo,
+    Sequence,
 }
 
 impl ActivePanel {
     /// All panel variants in tab-cycle order (excluding None).
-    const PANELS: [ActivePanel; 4] = [
+    const PANELS: [ActivePanel; 5] = [
         ActivePanel::Interface,
         ActivePanel::Regions,
         ActivePanel::Iteration,
         ActivePanel::ChainInfo,
+        ActivePanel::Sequence,
     ];
 
     /// Advance to the next panel in the cycle.
@@ -61,6 +88,16 @@ impl ActivePanel {
             Self::None => 0,
             Self::Interface => crate::ui::interface_panel::SIDEBAR_WIDTH,
             Self::Regions | Self::Iteration | Self::ChainInfo => 34,
+            Self::Sequence => 60,
+        }
+    }
+
+    /// Panel height in rows for vertical (bottom) layout mode.
+    pub fn height(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Sequence => 14,
+            _ => 10,
         }
     }
 
@@ -72,7 +109,161 @@ impl ActivePanel {
             Self::Regions => "Regions",
             Self::Iteration => "Iteration",
             Self::ChainInfo => "ChainInfo",
+            Self::Sequence => "Sequence",
         }
+    }
+}
+
+/// Which field in the edit form the cursor is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    Chain,
+    RangeStart,
+    RangeEnd,
+    Action,
+    Label,
+}
+
+impl EditField {
+    /// All fields in tab order.
+    const FIELDS: [EditField; 5] = [
+        EditField::Chain,
+        EditField::RangeStart,
+        EditField::RangeEnd,
+        EditField::Action,
+        EditField::Label,
+    ];
+
+    /// Advance to the next field in the cycle.
+    pub fn next(self) -> Self {
+        let idx = Self::FIELDS.iter().position(|&f| f == self).unwrap_or(0);
+        Self::FIELDS[(idx + 1) % Self::FIELDS.len()]
+    }
+
+    /// Go back to the previous field in the cycle.
+    pub fn prev(self) -> Self {
+        let idx = Self::FIELDS.iter().position(|&f| f == self).unwrap_or(0);
+        Self::FIELDS[(idx + Self::FIELDS.len() - 1) % Self::FIELDS.len()]
+    }
+}
+
+/// State for sequence selection in the Sequence panel.
+#[derive(Debug, Clone, Default)]
+pub struct SeqSelection {
+    /// Start residue index of the selection (inclusive).
+    pub start: Option<usize>,
+    /// End residue index of the selection (inclusive).
+    pub end: Option<usize>,
+    /// Whether a mouse drag is in progress.
+    pub dragging: bool,
+}
+
+impl SeqSelection {
+    /// Return the inclusive range of selected residues, sorted.
+    pub fn range(&self) -> Option<(usize, usize)> {
+        match (self.start, self.end) {
+            (Some(s), Some(e)) => Some((s.min(e), s.max(e))),
+            (Some(s), None) => Some((s, s)),
+            _ => None,
+        }
+    }
+
+    /// Check if a residue index is within the selection.
+    pub fn contains(&self, idx: usize) -> bool {
+        if let Some((s, e)) = self.range() {
+            idx >= s && idx <= e
+        } else {
+            false
+        }
+    }
+
+    /// Clear the selection.
+    pub fn clear(&mut self) {
+        self.start = None;
+        self.end = None;
+        self.dragging = false;
+    }
+}
+
+/// State for the inline region editor.
+#[derive(Debug, Clone)]
+pub struct EditState {
+    /// True when the editor is active.
+    pub editing: bool,
+    /// Which region is being edited (None = adding new region).
+    pub editing_region_idx: Option<usize>,
+    /// Which field the cursor is on.
+    pub cursor_field: EditField,
+    /// Draft chain letter.
+    pub draft_chain: String,
+    /// Draft range start.
+    pub draft_range_start: usize,
+    /// Draft range end.
+    pub draft_range_end: usize,
+    /// Draft action (keep/edit/replace/insert/delete).
+    pub draft_action: String,
+    /// Draft label text.
+    pub draft_label: String,
+    /// Validation error message to display below the edited region.
+    pub validation_error: Option<String>,
+    /// Confirmation state for delete: true after first 'd', awaiting second 'd'.
+    pub delete_confirm: bool,
+}
+
+impl Default for EditState {
+    fn default() -> Self {
+        Self {
+            editing: false,
+            editing_region_idx: None,
+            cursor_field: EditField::Chain,
+            draft_chain: "A".to_string(),
+            draft_range_start: 1,
+            draft_range_end: 10,
+            draft_action: "edit".to_string(),
+            draft_label: String::new(),
+            validation_error: None,
+            delete_confirm: false,
+        }
+    }
+}
+
+/// Predefined label names for the label/tag system.
+pub const PREDEFINED_LABELS: &[&str] = &[
+    "receptor",
+    "gem",
+    "solmate",
+    "linker",
+    "binding",
+    "loop",
+    "core",
+    "helix",
+    "beta",
+    "repaired",
+    "variant",
+    "active",
+    "interface",
+];
+
+/// All valid EditSpec action names (canonical long form).
+pub const VALID_ACTIONS: &[&str] = &["keep", "edit", "replace", "insert", "delete"];
+
+/// Return the display color for a label string.
+pub fn label_color(label: &str) -> Color {
+    match label {
+        "receptor" => Color::Rgb(100, 149, 237),
+        "gem" => Color::Rgb(0, 206, 209),
+        "solmate" => Color::Rgb(147, 112, 219),
+        "linker" => Color::Rgb(255, 165, 0),
+        "binding" => Color::Rgb(255, 215, 0),
+        "loop" => Color::Rgb(144, 238, 144),
+        "core" => Color::Rgb(210, 105, 30),
+        "helix" => Color::Rgb(70, 130, 180),
+        "beta" => Color::Rgb(186, 85, 211),
+        "repaired" => Color::Rgb(50, 205, 50),
+        "variant" => Color::Rgb(255, 99, 71),
+        "active" => Color::Rgb(0, 191, 255),
+        "interface" => Color::Rgb(255, 105, 180),
+        _ => Color::White,
     }
 }
 
@@ -267,6 +458,24 @@ pub struct App {
     /// Total number of clickable items in the active panel.
     /// Used to clamp scroll offset and validate click targets.
     pub panel_item_count: usize,
+    /// PyO3 bridge to gemlib Python APIs.  `None` when Python is unavailable,
+    /// in which case editing features are disabled and the app runs in read-only mode.
+    pub bridge: Option<GemlibBridge>,
+    /// Whether the Python/gemlib bridge was successfully initialized.
+    /// Controls the "Read-only" indicator in the header and status bar.
+    pub python_available: bool,
+    /// Current layout orientation, computed from terminal aspect ratio.
+    pub layout_mode: LayoutMode,
+    /// State for the inline region editor in the Regions panel.
+    pub edit_state: EditState,
+    /// Undo/redo operation history for EditSpec edits.
+    pub edit_history: EditHistory,
+    /// Cached validation issues, recomputed on every state change.
+    pub validation_issues: Vec<ValidationIssue>,
+    /// Horizontal scroll offset for the Sequence panel (in characters).
+    pub seq_h_scroll: u16,
+    /// Selection state for the Sequence panel.
+    pub seq_selection: SeqSelection,
 }
 
 impl App {
@@ -381,6 +590,20 @@ impl App {
 
         let connection_type = ConnectionType::detect();
 
+        // Initialize the Python bridge.  Failure is non-fatal: PV degrades to
+        // read-only mode and the header shows a "Read-only" indicator.
+        let (bridge, python_available) = match GemlibBridge::new() {
+            Ok(b) => {
+                eprintln!("Python bridge: initialized (gemlib + contiger available)");
+                (Some(b), true)
+            }
+            Err(e) => {
+                eprintln!("Warning: Python bridge unavailable — running in read-only mode.");
+                eprintln!("  Reason: {}", e);
+                (None, false)
+            }
+        };
+
         Self {
             protein,
             camera,
@@ -412,6 +635,14 @@ impl App {
             last_sidebar_rect: None,
             panel_click_header: 0,
             panel_item_count: 0,
+            bridge,
+            python_available,
+            layout_mode: LayoutMode::from_size(term_cols, term_rows),
+            edit_state: EditState::default(),
+            edit_history: EditHistory::default(),
+            validation_issues: Vec::new(),
+            seq_h_scroll: 0,
+            seq_selection: SeqSelection::default(),
         }
     }
 
@@ -702,6 +933,8 @@ impl App {
     /// Call this after changing `render_mode` so the protein fills the viewport
     /// correctly for the new framebuffer dimensions.
     pub fn recalculate_zoom(&mut self, term_cols: u16, term_rows: u16) {
+        // Update layout mode on resize
+        self.layout_mode = LayoutMode::from_size(term_cols, term_rows);
         let radius = self.protein.bounding_radius().max(1.0);
         let vp_rows = term_rows.saturating_sub(4) as f64;
         let vp_cols = term_cols as f64;
@@ -761,5 +994,489 @@ impl App {
         }
 
         self.recalculate_zoom(term_cols, term_rows);
+    }
+
+    // -- Region editing methods -----------------------------------------------
+
+    /// Take a snapshot of the current region list for undo history.
+    fn snapshot_regions(&self) -> Vec<EditSpecRegion> {
+        self.annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Push the current state onto the undo history before an edit operation.
+    fn push_history(&mut self, description: &str) {
+        self.edit_history.push(HistoryEntry {
+            description: description.to_string(),
+            snapshot: self.snapshot_regions(),
+            focused_region: self.focused_region,
+            panel_scroll: self.panel_scroll,
+        });
+    }
+
+    /// Re-run validation on the current region list and cache the results.
+    fn revalidate(&mut self) {
+        self.validation_issues = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .map(|regions| validate_regions(regions))
+            .unwrap_or_default();
+    }
+
+    /// Undo the last edit operation.  Restores the region list, focus, and scroll
+    /// from the history snapshot.
+    pub fn edit_undo(&mut self) {
+        if let Some(entry) = self.edit_history.undo() {
+            if self.annotation.is_none() {
+                self.annotation = Some(Annotation {
+                    editspec_regions: Some(Vec::new()),
+                    iteration: None,
+                    highlights: None,
+                });
+            }
+            if let Some(ref mut ann) = self.annotation {
+                ann.editspec_regions = Some(entry.snapshot);
+            }
+            self.focused_region = entry.focused_region;
+            self.panel_scroll = entry.panel_scroll;
+            self.revalidate();
+        }
+    }
+
+    /// Redo the last undone edit operation.
+    pub fn edit_redo(&mut self) {
+        if let Some(entry) = self.edit_history.redo() {
+            if self.annotation.is_none() {
+                self.annotation = Some(Annotation {
+                    editspec_regions: Some(Vec::new()),
+                    iteration: None,
+                    highlights: None,
+                });
+            }
+            if let Some(ref mut ann) = self.annotation {
+                ann.editspec_regions = Some(entry.snapshot);
+            }
+            self.focused_region = entry.focused_region;
+            self.panel_scroll = entry.panel_scroll;
+            self.revalidate();
+        }
+    }
+
+    /// Enter edit mode for an existing region (Enter key on a region).
+    pub fn edit_region_start(&mut self) {
+        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+            return;
+        }
+        let regions = match self.annotation.as_ref().and_then(|a| a.editspec_regions.as_ref()) {
+            Some(r) => r,
+            None => return,
+        };
+        let idx = self.focused_region.min(regions.len().saturating_sub(1));
+        let region = &regions[idx];
+
+        self.edit_state = EditState {
+            editing: true,
+            editing_region_idx: Some(idx),
+            cursor_field: EditField::Chain,
+            draft_chain: region.chain.clone(),
+            draft_range_start: region.range[0],
+            draft_range_end: region.range[1],
+            draft_action: region.action.clone(),
+            draft_label: region.label.clone().unwrap_or_default(),
+            validation_error: None,
+            delete_confirm: false,
+        };
+    }
+
+    /// Start adding a new region (a key in Regions panel).
+    pub fn edit_region_add(&mut self) {
+        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+            return;
+        }
+        // Default chain is the first protein chain, or "A" if no chains.
+        let default_chain = self
+            .protein
+            .chains
+            .first()
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| "A".to_string());
+
+        self.edit_state = EditState {
+            editing: true,
+            editing_region_idx: None,
+            cursor_field: EditField::Chain,
+            draft_chain: default_chain,
+            draft_range_start: 1,
+            draft_range_end: 10,
+            draft_action: "edit".to_string(),
+            draft_label: String::new(),
+            validation_error: None,
+            delete_confirm: false,
+        };
+    }
+
+    /// Delete the focused region (dd — double d confirmation).
+    /// Returns true if the delete was executed (second 'd').
+    pub fn edit_region_delete(&mut self) -> bool {
+        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+            return false;
+        }
+
+        if !self.edit_state.delete_confirm {
+            // First 'd' — enter confirmation state.
+            self.edit_state.delete_confirm = true;
+            return false;
+        }
+
+        // Second 'd' — execute the delete.
+        self.edit_state.delete_confirm = false;
+
+        // Take snapshot and push history before mutation.
+        let snapshot = self.snapshot_regions();
+        let idx = self.focused_region.min(snapshot.len().saturating_sub(1));
+        if snapshot.is_empty() {
+            return false;
+        }
+        self.edit_history.push(HistoryEntry {
+            description: format!("delete region {}", idx),
+            snapshot,
+            focused_region: self.focused_region,
+            panel_scroll: self.panel_scroll,
+        });
+
+        if let Some(ref mut ann) = self.annotation {
+            if let Some(ref mut regions) = ann.editspec_regions {
+                if !regions.is_empty() {
+                    regions.remove(idx);
+                    // Clamp focused_region to valid range.
+                    if self.focused_region >= regions.len() && !regions.is_empty() {
+                        self.focused_region = regions.len() - 1;
+                    }
+                    self.revalidate();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Split the focused region at its midpoint (s key in Regions panel).
+    pub fn edit_region_split(&mut self) {
+        if self.active_panel != ActivePanel::Regions || self.edit_state.editing {
+            return;
+        }
+
+        // Collect split parameters from immutable borrow first.
+        let split_info = {
+            match self.annotation.as_ref().and_then(|a| a.editspec_regions.as_ref()) {
+                Some(regions) if !regions.is_empty() => {
+                    let idx = self.focused_region.min(regions.len().saturating_sub(1));
+                    let region = &regions[idx];
+                    let start = region.range[0];
+                    let end = region.range[1];
+                    if end <= start + 1 {
+                        None // Too small to split.
+                    } else {
+                        Some((idx, start, end, region.chain.clone(), region.action.clone(), region.label.clone()))
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        let Some((idx, start, end, chain, action, label)) = split_info else {
+            return;
+        };
+
+        let mid = start + (end - start) / 2;
+
+        // Push history before mutation.
+        self.push_history(&format!("split region {}", idx));
+
+        if let Some(ref mut ann) = self.annotation {
+            if let Some(ref mut regions) = ann.editspec_regions {
+                // Modify the original region to be the first half.
+                regions[idx].range[1] = mid;
+
+                // Insert the second half as a new region right after.
+                let new_region = EditSpecRegion {
+                    chain,
+                    range: [mid + 1, end],
+                    action,
+                    label,
+                };
+                regions.insert(idx + 1, new_region);
+                self.revalidate();
+            }
+        }
+    }
+
+    /// Cancel the current edit operation (Escape key).
+    pub fn edit_cancel(&mut self) {
+        self.edit_state = EditState::default();
+    }
+
+    /// Move the cursor to the next/previous edit field.
+    pub fn edit_next_field(&mut self) {
+        if self.edit_state.editing {
+            self.edit_state.cursor_field = self.edit_state.cursor_field.next();
+        }
+    }
+
+    pub fn edit_prev_field(&mut self) {
+        if self.edit_state.editing {
+            self.edit_state.cursor_field = self.edit_state.cursor_field.prev();
+        }
+    }
+
+    /// Cycle the action field forward/backward.
+    pub fn edit_cycle_action(&mut self, forward: bool) {
+        if !self.edit_state.editing {
+            return;
+        }
+        let current_idx = VALID_ACTIONS
+            .iter()
+            .position(|&a| a == self.edit_state.draft_action)
+            .unwrap_or(0);
+        let new_idx = if forward {
+            (current_idx + 1) % VALID_ACTIONS.len()
+        } else {
+            (current_idx + VALID_ACTIONS.len() - 1) % VALID_ACTIONS.len()
+        };
+        self.edit_state.draft_action = VALID_ACTIONS[new_idx].to_string();
+    }
+
+    /// Cycle the chain through available chains in the protein.
+    pub fn edit_cycle_chain(&mut self, forward: bool) {
+        if !self.edit_state.editing {
+            return;
+        }
+        let chains: Vec<String> = self.protein.chains.iter().map(|c| c.id.clone()).collect();
+        if chains.is_empty() {
+            return;
+        }
+        let current_idx = chains
+            .iter()
+            .position(|c| c == &self.edit_state.draft_chain)
+            .unwrap_or(0);
+        let new_idx = if forward {
+            (current_idx + 1) % chains.len()
+        } else {
+            (current_idx + chains.len() - 1) % chains.len()
+        };
+        self.edit_state.draft_chain = chains[new_idx].clone();
+    }
+
+    /// Increment or decrement a range field by the given delta.
+    pub fn edit_adjust_range(&mut self, field: EditField, delta: i32) {
+        if !self.edit_state.editing {
+            return;
+        }
+        match field {
+            EditField::RangeStart => {
+                let v = self.edit_state.draft_range_start as i32 + delta;
+                self.edit_state.draft_range_start = v.max(1) as usize;
+            }
+            EditField::RangeEnd => {
+                let v = self.edit_state.draft_range_end as i32 + delta;
+                self.edit_state.draft_range_end = v.max(1) as usize;
+            }
+            _ => {}
+        }
+    }
+
+    /// Input a character into the label field.
+    pub fn edit_label_input(&mut self, ch: char) {
+        if !self.edit_state.editing || self.edit_state.cursor_field != EditField::Label {
+            return;
+        }
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            if self.edit_state.draft_label.len() < 20 {
+                self.edit_state.draft_label.push(ch);
+            }
+        }
+    }
+
+    /// Delete the last character from the label field.
+    pub fn edit_label_backspace(&mut self) {
+        if !self.edit_state.editing || self.edit_state.cursor_field != EditField::Label {
+            return;
+        }
+        self.edit_state.draft_label.pop();
+    }
+
+    /// Cycle through predefined labels for the label field (Tab in label field).
+    pub fn edit_cycle_label(&mut self) {
+        if !self.edit_state.editing || self.edit_state.cursor_field != EditField::Label {
+            return;
+        }
+        let current = self.edit_state.draft_label.as_str();
+        let idx = PREDEFINED_LABELS
+            .iter()
+            .position(|&l| l == current)
+            .map(|i| (i + 1) % PREDEFINED_LABELS.len())
+            .unwrap_or(0);
+        self.edit_state.draft_label = PREDEFINED_LABELS[idx].to_string();
+    }
+
+    /// Validate the current draft and save it.
+    /// Returns true if save was successful.
+    pub fn edit_save(&mut self) -> bool {
+        if !self.edit_state.editing {
+            return false;
+        }
+
+        // Local validation.
+        let start = self.edit_state.draft_range_start;
+        let end = self.edit_state.draft_range_end;
+        let chain = &self.edit_state.draft_chain;
+        let action = &self.edit_state.draft_action;
+
+        // Validate range.
+        if start > end {
+            self.edit_state.validation_error =
+                Some(format!("Invalid range: {} > {}", start, end));
+            return false;
+        }
+
+        // Validate action.
+        if !VALID_ACTIONS.contains(&action.as_str()) {
+            self.edit_state.validation_error =
+                Some(format!("Unknown action: '{}'", action));
+            return false;
+        }
+
+        // Check overlap with existing regions (excluding the one being edited).
+        let editing_idx = self.edit_state.editing_region_idx;
+        if let Some(ref ann) = self.annotation {
+            if let Some(ref regions) = ann.editspec_regions {
+                for (i, r) in regions.iter().enumerate() {
+                    if Some(i) == editing_idx {
+                        continue; // Skip the region being edited.
+                    }
+                    if r.chain == *chain && r.range[1] >= start && r.range[0] <= end {
+                        self.edit_state.validation_error = Some(format!(
+                            "Overlaps with region {} [{}-{}] on chain {}",
+                            i, r.range[0], r.range[1], r.chain
+                        ));
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Optionally validate via bridge if available.
+        if let Some(ref bridge) = self.bridge {
+            let bridge_regions = {
+                let mut all: Vec<crate::bridge::EditSpecRegionData> = Vec::new();
+                // Collect existing regions.
+                if let Some(ref ann) = self.annotation {
+                    if let Some(ref regions) = ann.editspec_regions {
+                        for (i, r) in regions.iter().enumerate() {
+                            if Some(i) == editing_idx {
+                                // Replace with draft.
+                                all.push(crate::bridge::EditSpecRegionData {
+                                    chain: self.edit_state.draft_chain.clone(),
+                                    range: [self.edit_state.draft_range_start, self.edit_state.draft_range_end],
+                                    action: self.edit_state.draft_action.clone(),
+                                    label: if self.edit_state.draft_label.is_empty() {
+                                        None
+                                    } else {
+                                        Some(self.edit_state.draft_label.clone())
+                                    },
+                                });
+                            } else {
+                                all.push(crate::bridge::EditSpecRegionData {
+                                    chain: r.chain.clone(),
+                                    range: r.range,
+                                    action: r.action.clone(),
+                                    label: r.label.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                // If adding new, append draft.
+                if editing_idx.is_none() {
+                    all.push(crate::bridge::EditSpecRegionData {
+                        chain: self.edit_state.draft_chain.clone(),
+                        range: [self.edit_state.draft_range_start, self.edit_state.draft_range_end],
+                        action: self.edit_state.draft_action.clone(),
+                        label: if self.edit_state.draft_label.is_empty() {
+                            None
+                        } else {
+                            Some(self.edit_state.draft_label.clone())
+                        },
+                    });
+                }
+                all
+            };
+            if let Ok(issues) = bridge.validate_edit_spec(&bridge_regions) {
+                let errors: Vec<_> = issues
+                    .iter()
+                    .filter(|i| i.severity == "error")
+                    .collect();
+                if !errors.is_empty() {
+                    self.edit_state.validation_error =
+                        Some(errors[0].message.clone());
+                    return false;
+                }
+            }
+        }
+
+        // All validation passed — push history before mutation.
+        let description = match editing_idx {
+            Some(idx) => format!("edit region {}", idx),
+            None => "add region".to_string(),
+        };
+        self.push_history(&description);
+
+        // Apply the change.
+        let new_region = EditSpecRegion {
+            chain: self.edit_state.draft_chain.clone(),
+            range: [self.edit_state.draft_range_start, self.edit_state.draft_range_end],
+            action: self.edit_state.draft_action.clone(),
+            label: if self.edit_state.draft_label.is_empty() {
+                None
+            } else {
+                Some(self.edit_state.draft_label.clone())
+            },
+        };
+
+        // Ensure annotation structure exists.
+        if self.annotation.is_none() {
+            self.annotation = Some(Annotation {
+                editspec_regions: Some(Vec::new()),
+                iteration: None,
+                highlights: None,
+            });
+        }
+
+        if let Some(ref mut ann) = self.annotation {
+            if ann.editspec_regions.is_none() {
+                ann.editspec_regions = Some(Vec::new());
+            }
+            if let Some(ref mut regions) = ann.editspec_regions {
+                match editing_idx {
+                    Some(idx) if idx < regions.len() => {
+                        regions[idx] = new_region;
+                    }
+                    _ => {
+                        // Adding new region.
+                        regions.push(new_region);
+                        self.focused_region = regions.len() - 1;
+                    }
+                }
+            }
+        }
+
+        // Clear edit state.
+        self.edit_state = EditState::default();
+        self.revalidate();
+        true
     }
 }

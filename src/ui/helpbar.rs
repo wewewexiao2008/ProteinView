@@ -4,74 +4,225 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-/// Render the keybinding hints bar at the bottom
-pub fn render_helpbar(frame: &mut Frame, area: Rect) {
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "h/l",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": rotY  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "j/k",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": rotX  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "+/-",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": zoom  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "Tab",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": panels  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "f",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": close  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "c",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": color  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "v",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": mode  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "?",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": help  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "q",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": quit ", Style::default().fg(Color::Gray)),
-        Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
-    ]));
+use crate::app::{ActivePanel, App};
+
+/// Render the keybinding hints bar at the bottom.
+pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
+    let spans = if app.edit_state.editing && app.active_panel == ActivePanel::Regions {
+        // Edit mode keybindings.
+        vec![
+            Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":field  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "+/-",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":value  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":save  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":cancel ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
+        ]
+    } else if app.active_panel == ActivePanel::Sequence {
+        // Sequence panel keybindings.
+        vec![
+            Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "h/l",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":scroll  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "[/]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":chain  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "click",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":select  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "y",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":copy range  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Y",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":copy seq  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "f",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":close ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
+        ]
+    } else if app.active_panel == ActivePanel::Regions {
+        // Regions panel view mode keybindings.
+        vec![
+            Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":edit  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "a",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":add  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "d",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":del  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "s",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":split  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "u",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":undo  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Ctrl+r",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":redo  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "j/k",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":nav  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(":help ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        // Default keybindings.
+        vec![
+            Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "h/l",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": rotY  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "j/k",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": rotX  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "+/-",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": zoom  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": panels  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "f",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": close  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "c",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": color  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "v",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": mode  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "?",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": help  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(": quit ", Style::default().fg(Color::Gray)),
+            Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
+        ]
+    };
+
+    let help = Paragraph::new(Line::from(spans));
     frame.render_widget(help, area);
 }

@@ -1,4 +1,6 @@
 mod app;
+mod bridge;
+mod edit_history;
 mod event;
 mod model;
 mod parser;
@@ -18,7 +20,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use app::{ActivePanel, App, AppConfig, ConnectionType, RenderMode, VizMode};
+use app::{ActivePanel, App, AppConfig, ConnectionType, LayoutMode, RenderMode, VizMode};
 
 macro_rules! log {
     ($file:expr, $($arg:tt)*) => {
@@ -82,6 +84,238 @@ struct Cli {
     annotation: Option<String>,
 }
 
+/// Handle key events when in Regions panel view mode (not editing).
+/// Returns true if the key was consumed.
+fn handle_regions_view_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    match key.code {
+        KeyCode::Enter => {
+            app.edit_state.delete_confirm = false;
+            app.edit_region_start();
+            true
+        }
+        KeyCode::Char('a') => {
+            app.edit_state.delete_confirm = false;
+            app.edit_region_add();
+            true
+        }
+        KeyCode::Char('d') => {
+            app.edit_region_delete();
+            true
+        }
+        KeyCode::Char('s') => {
+            app.edit_state.delete_confirm = false;
+            app.edit_region_split();
+            true
+        }
+        // Undo: restore previous state from history.
+        KeyCode::Char('u') => {
+            app.edit_state.delete_confirm = false;
+            app.edit_undo();
+            true
+        }
+        // Redo: restore next state from redo stack.
+        KeyCode::Char('r')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            app.edit_state.delete_confirm = false;
+            app.edit_redo();
+            true
+        }
+        // j/k navigate regions (only when Regions panel is active and not editing).
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.edit_state.delete_confirm = false;
+            if let Some(ref ann) = app.annotation {
+                if let Some(ref regions) = ann.editspec_regions {
+                    if !regions.is_empty() {
+                        app.focused_region =
+                            (app.focused_region + 1).min(regions.len() - 1);
+                    }
+                }
+            }
+            true
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.edit_state.delete_confirm = false;
+            if app.focused_region > 0 {
+                app.focused_region -= 1;
+            }
+            true
+        }
+        _ => {
+            // Any unhandled key cancels the delete confirmation.
+            if app.edit_state.delete_confirm {
+                app.edit_state.delete_confirm = false;
+            }
+            false
+        }
+    }
+}
+
+/// Handle key events when in Regions edit mode.
+fn handle_edit_mode_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) {
+    use app::EditField;
+
+    match key.code {
+        // Tab / Shift+Tab: move between fields.
+        KeyCode::Tab => {
+            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                app.edit_prev_field();
+            } else if app.edit_state.cursor_field == EditField::Label {
+                // In label field, Tab cycles predefined labels.
+                app.edit_cycle_label();
+            } else {
+                app.edit_next_field();
+            }
+        }
+        // j/k: move between fields (same as Tab/Shift+Tab in edit mode).
+        KeyCode::Char('j') => app.edit_next_field(),
+        KeyCode::Char('k') => app.edit_prev_field(),
+
+        // + / = / - : adjust values or cycle options.
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            match app.edit_state.cursor_field {
+                EditField::Action => app.edit_cycle_action(true),
+                EditField::Chain => app.edit_cycle_chain(true),
+                EditField::RangeStart => app.edit_adjust_range(EditField::RangeStart, 1),
+                EditField::RangeEnd => app.edit_adjust_range(EditField::RangeEnd, 1),
+                _ => {}
+            }
+        }
+        KeyCode::Char('-') => {
+            match app.edit_state.cursor_field {
+                EditField::Action => app.edit_cycle_action(false),
+                EditField::Chain => app.edit_cycle_chain(false),
+                EditField::RangeStart => app.edit_adjust_range(EditField::RangeStart, -1),
+                EditField::RangeEnd => app.edit_adjust_range(EditField::RangeEnd, -1),
+                _ => {}
+            }
+        }
+
+        // h / l: cycle actions (same as +/- for action/chain fields).
+        KeyCode::Char('l') => {
+            match app.edit_state.cursor_field {
+                EditField::Action => app.edit_cycle_action(true),
+                EditField::Chain => app.edit_cycle_chain(true),
+                EditField::RangeStart => app.edit_adjust_range(EditField::RangeStart, 1),
+                EditField::RangeEnd => app.edit_adjust_range(EditField::RangeEnd, 1),
+                _ => {}
+            }
+        }
+        KeyCode::Char('h') => {
+            match app.edit_state.cursor_field {
+                EditField::Action => app.edit_cycle_action(false),
+                EditField::Chain => app.edit_cycle_chain(false),
+                EditField::RangeStart => app.edit_adjust_range(EditField::RangeStart, -1),
+                EditField::RangeEnd => app.edit_adjust_range(EditField::RangeEnd, -1),
+                _ => {}
+            }
+        }
+
+        // Enter: save.
+        KeyCode::Enter => {
+            app.edit_save();
+        }
+
+        // Escape: cancel.
+        KeyCode::Esc => {
+            app.edit_cancel();
+        }
+
+        // Backspace: delete last char in label field.
+        KeyCode::Backspace => {
+            app.edit_label_backspace();
+        }
+
+        // Direct character input for label field.
+        KeyCode::Char(ch) => {
+            app.edit_label_input(ch);
+        }
+
+        _ => {}
+    }
+}
+
+/// Handle key events when in Sequence panel mode.
+/// Returns true if the key was consumed.
+fn handle_sequence_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    match key.code {
+        // Horizontal scroll
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.seq_h_scroll = app.seq_h_scroll.saturating_sub(5);
+            true
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            let chain = app.protein.chains.get(app.current_chain);
+            let max_res = chain.map(|c| c.residues.len()).unwrap_or(0);
+            let max_scroll = max_res.saturating_sub(10) as u16;
+            app.seq_h_scroll = app.seq_h_scroll.saturating_add(5).min(max_scroll);
+            true
+        }
+        // Chain navigation
+        KeyCode::Char('[') => {
+            app.prev_chain();
+            app.seq_h_scroll = 0;
+            app.seq_selection.clear();
+            true
+        }
+        KeyCode::Char(']') => {
+            app.next_chain();
+            app.seq_h_scroll = 0;
+            app.seq_selection.clear();
+            true
+        }
+        // y: yank selected range (e.g. "A:51-80")
+        KeyCode::Char('y') => {
+            if let Some((s, e)) = app.seq_selection.range() {
+                let chain = app.protein.chains.get(app.current_chain);
+                if let Some(c) = chain {
+                    if s < c.residues.len() && e < c.residues.len() {
+                        let seq_start = c.residues[s].seq_num;
+                        let seq_end = c.residues[e].seq_num;
+                        let text = format!("{}:{}-{}", c.id, seq_start, seq_end);
+                        ui::sequence_panel::yank_to_clipboard(&text);
+                    }
+                }
+            }
+            true
+        }
+        // Y (shift): yank selected sequence letters
+        KeyCode::Char('Y') => {
+            if let Some((s, e)) = app.seq_selection.range() {
+                let chain = app.protein.chains.get(app.current_chain);
+                if let Some(c) = chain {
+                    use ui::sequence_panel::aa_one_letter;
+                    let seq: String = c.residues[s..=e]
+                        .iter()
+                        .map(|r| aa_one_letter(&r.name))
+                        .collect();
+                    if !seq.is_empty() {
+                        ui::sequence_panel::yank_to_clipboard(&seq);
+                    }
+                }
+            }
+            true
+        }
+        // Escape: clear selection
+        KeyCode::Esc => {
+            app.seq_selection.clear();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Handle mouse events for sidebar interaction.
 fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::fs::File>) {
     log!(
@@ -112,8 +346,32 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
                     && me.row < sidebar_rect.y + sidebar_rect.height
                 {
                     // Clicked inside sidebar — determine which item was clicked
-                    handle_sidebar_click(app, me.row, sidebar_rect, logfile);
+                    handle_sidebar_click(app, me.row, me.column, sidebar_rect, logfile);
                 }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Handle mouse drag for sequence panel selection
+            if app.active_panel == ActivePanel::Sequence && app.seq_selection.dragging {
+                if let Some(sidebar_rect) = app.last_sidebar_rect {
+                    if me.column >= sidebar_rect.x
+                        && me.column < sidebar_rect.x + sidebar_rect.width
+                    {
+                        let col_offset = me.column.saturating_sub(sidebar_rect.x) as usize;
+                        let residue_idx = app.seq_h_scroll as usize + col_offset;
+                        let chain = app.protein.chains.get(app.current_chain);
+                        let max_res = chain.map(|c| c.residues.len()).unwrap_or(0);
+                        if residue_idx < max_res {
+                            app.seq_selection.end = Some(residue_idx);
+                        }
+                    }
+                }
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // End drag
+            if app.seq_selection.dragging {
+                app.seq_selection.dragging = false;
             }
         }
         _ => {}
@@ -138,6 +396,7 @@ fn max_panel_scroll(app: &App) -> u16 {
 fn handle_sidebar_click(
     app: &mut App,
     row: u16,
+    col: u16,
     sidebar_rect: Rect,
     logfile: &mut Option<std::fs::File>,
 ) {
@@ -174,6 +433,25 @@ fn handle_sidebar_click(
                     if app.active_panel == ActivePanel::Interface {
                         // Trigger interface color rebuild if needed
                     }
+                }
+            }
+        }
+        ActivePanel::Sequence => {
+            // Mouse click in sequence panel: select residue at click position
+            let header = app.panel_click_header;
+            if item_row == header && app.panel_item_count > 0 {
+                // Clicked on the sequence line (header + 0 = sequence line)
+                let col_offset = col.saturating_sub(sidebar_rect.x) as usize;
+                let residue_idx = app.seq_h_scroll as usize + col_offset;
+                if residue_idx < app.panel_item_count {
+                    app.seq_selection.start = Some(residue_idx);
+                    app.seq_selection.end = Some(residue_idx);
+                    app.seq_selection.dragging = true;
+                    log!(
+                        logfile,
+                        "sidebar_click: panel=Sequence residue_idx={}",
+                        residue_idx
+                    );
                 }
             }
         }
@@ -419,11 +697,37 @@ fn main() -> Result<()> {
             match app_event {
                 event::AppEvent::Resize(cols, rows) => {
                     log!(logfile, "resize: {}x{}", cols, rows);
+                    let old_mode = app.layout_mode;
                     app.recalculate_zoom(cols, rows);
                     app.mesh_dirty_flag();
+                    // Reset scroll when layout mode changes to avoid stale offsets
+                    if app.layout_mode != old_mode {
+                        app.panel_scroll = 0;
+                    }
                 }
                 event::AppEvent::Key(key) => {
                     log!(logfile, "key: {:?}", key.code);
+
+                    // In Regions edit mode, intercept keys for field editing.
+                    if app.edit_state.editing && app.active_panel == ActivePanel::Regions {
+                        handle_edit_mode_key(&mut app, key);
+                        continue;
+                    }
+
+                    // In Regions panel view mode, handle edit operations.
+                    if app.active_panel == ActivePanel::Regions {
+                        if handle_regions_view_key(&mut app, key) {
+                            continue;
+                        }
+                    }
+
+                    // In Sequence panel mode, handle sequence-specific keys.
+                    if app.active_panel == ActivePanel::Sequence {
+                        if handle_sequence_key(&mut app, key) {
+                            continue;
+                        }
+                    }
+
                     match key.code {
                         KeyCode::Char('q') => app.should_quit = true,
                         KeyCode::Char('c')
@@ -554,60 +858,132 @@ fn main() -> Result<()> {
 
         let draw_start = Instant::now();
         terminal.draw(|frame| {
-            // Determine sidebar area based on active panel
+            // Determine panel area and main area based on active panel and layout mode
             let main_area = if app.active_panel != ActivePanel::None {
-                let sidebar_w = app.active_panel.width();
-                let horiz = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([
-                        Constraint::Length(sidebar_w),
-                        Constraint::Min(20),
-                    ])
-                    .split(frame.area());
+                match app.layout_mode {
+                    LayoutMode::Horizontal => {
+                        let sidebar_w = app.active_panel.width();
+                        let horiz = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(sidebar_w),
+                                Constraint::Min(20),
+                            ])
+                            .split(frame.area());
 
-                // Store sidebar rect for mouse hit-testing
-                app.last_sidebar_rect = Some(horiz[0]);
+                        // Store sidebar rect for mouse hit-testing
+                        app.last_sidebar_rect = Some(horiz[0]);
 
-                let sidebar_area = horiz[0];
-                match app.active_panel {
-                    ActivePanel::Interface => {
-                        let summary = app.interface_analysis.summary(&app.protein);
-                        let chain_names = app.chain_names();
-                        let interaction_counts = app.interface_analysis.interaction_counts();
-                        ui::interface_panel::render_interface_panel(
-                            frame,
-                            sidebar_area,
-                            &summary,
-                            app.current_chain,
-                            &chain_names,
-                            app.show_interactions,
-                            interaction_counts,
-                        );
+                        let sidebar_area = horiz[0];
+                        match app.active_panel {
+                            ActivePanel::Interface => {
+                                let summary = app.interface_analysis.summary(&app.protein);
+                                let chain_names = app.chain_names();
+                                let interaction_counts = app.interface_analysis.interaction_counts();
+                                ui::interface_panel::render_interface_panel(
+                                    frame,
+                                    sidebar_area,
+                                    &summary,
+                                    app.current_chain,
+                                    &chain_names,
+                                    app.show_interactions,
+                                    interaction_counts,
+                                );
+                            }
+                            ActivePanel::Regions => {
+                                ui::regions_panel::render_regions_panel(
+                                    frame,
+                                    sidebar_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::Iteration => {
+                                ui::iteration_panel::render_iteration_panel(
+                                    frame,
+                                    sidebar_area,
+                                    &app,
+                                );
+                            }
+                            ActivePanel::ChainInfo => {
+                                ui::chain_info_panel::render_chain_info_panel(
+                                    frame,
+                                    sidebar_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::Sequence => {
+                                ui::sequence_panel::render_sequence_panel(
+                                    frame,
+                                    sidebar_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::None => unreachable!(),
+                        }
+                        horiz[1]
                     }
-                    ActivePanel::Regions => {
-                        ui::regions_panel::render_regions_panel(
-                            frame,
-                            sidebar_area,
-                            &mut app,
-                        );
+                    LayoutMode::Vertical => {
+                        let panel_h = app.active_panel.height();
+                        let vert = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Min(10),
+                                Constraint::Length(panel_h),
+                            ])
+                            .split(frame.area());
+
+                        // Store panel rect for mouse hit-testing
+                        app.last_sidebar_rect = Some(vert[1]);
+
+                        let panel_area = vert[1];
+                        match app.active_panel {
+                            ActivePanel::Interface => {
+                                let summary = app.interface_analysis.summary(&app.protein);
+                                let chain_names = app.chain_names();
+                                let interaction_counts = app.interface_analysis.interaction_counts();
+                                ui::interface_panel::render_interface_panel(
+                                    frame,
+                                    panel_area,
+                                    &summary,
+                                    app.current_chain,
+                                    &chain_names,
+                                    app.show_interactions,
+                                    interaction_counts,
+                                );
+                            }
+                            ActivePanel::Regions => {
+                                ui::regions_panel::render_regions_panel(
+                                    frame,
+                                    panel_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::Iteration => {
+                                ui::iteration_panel::render_iteration_panel(
+                                    frame,
+                                    panel_area,
+                                    &app,
+                                );
+                            }
+                            ActivePanel::ChainInfo => {
+                                ui::chain_info_panel::render_chain_info_panel(
+                                    frame,
+                                    panel_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::Sequence => {
+                                ui::sequence_panel::render_sequence_panel(
+                                    frame,
+                                    panel_area,
+                                    &mut app,
+                                );
+                            }
+                            ActivePanel::None => unreachable!(),
+                        }
+                        vert[0]
                     }
-                    ActivePanel::Iteration => {
-                        ui::iteration_panel::render_iteration_panel(
-                            frame,
-                            sidebar_area,
-                            &app,
-                        );
-                    }
-                    ActivePanel::ChainInfo => {
-                        ui::chain_info_panel::render_chain_info_panel(
-                            frame,
-                            sidebar_area,
-                            &mut app,
-                        );
-                    }
-                    ActivePanel::None => unreachable!(),
                 }
-                horiz[1]
             } else {
                 app.last_sidebar_rect = None;
                 frame.area()
@@ -623,10 +999,10 @@ fn main() -> Result<()> {
                 ])
                 .split(main_area);
 
-            ui::header::render_header(frame, chunks[0], &app.protein.name);
+            ui::header::render_header(frame, chunks[0], &app.protein.name, app.python_available);
             ui::viewport::render_viewport(frame, chunks[1], &app);
             ui::statusbar::render_statusbar(frame, chunks[2], &app);
-            ui::helpbar::render_helpbar(frame, chunks[3]);
+            ui::helpbar::render_helpbar(frame, chunks[3], &app);
 
             if app.show_help {
                 ui::help_overlay::render_help_overlay(frame, frame.area());
