@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event, KeyEvent, MouseEvent};
 
 /// Application-level event that wraps terminal events we care about.
 pub enum AppEvent {
@@ -12,9 +12,11 @@ pub enum AppEvent {
     Key(KeyEvent),
     /// The terminal was resized to (columns, rows).
     Resize(u16, u16),
+    /// A mouse event (click, scroll, etc.).
+    Mouse(MouseEvent),
 }
 
-/// Spawns a dedicated input thread that sends key and resize events through a channel.
+/// Spawns a dedicated input thread that sends key, resize, and mouse events through a channel.
 /// The thread checks `quit_flag` each iteration and stops when it's set.
 /// Returns (receiver, quit_flag).
 pub fn spawn_input_thread() -> (mpsc::Receiver<AppEvent>, Arc<AtomicBool>) {
@@ -37,6 +39,11 @@ pub fn spawn_input_thread() -> (mpsc::Receiver<AppEvent>, Arc<AtomicBool>) {
                     }
                     Ok(Event::Resize(w, h)) => {
                         if tx.send(AppEvent::Resize(w, h)).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Ok(Event::Mouse(me)) => {
+                        if tx.send(AppEvent::Mouse(me)).is_err() {
                             break; // receiver dropped
                         }
                     }

@@ -8,17 +8,17 @@ mod ui;
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::KeyCode,
+    event::{KeyCode, MouseButton, MouseEvent, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use app::{App, AppConfig, ConnectionType, RenderMode, VizMode};
+use app::{ActivePanel, App, AppConfig, ConnectionType, RenderMode, VizMode};
 
 macro_rules! log {
     ($file:expr, $($arg:tt)*) => {
@@ -76,6 +76,109 @@ struct Cli {
     /// Focus on a specific chain by name at startup
     #[arg(long)]
     focus_chain: Option<String>,
+
+    /// Load annotation JSON for gemlib context panels
+    #[arg(long)]
+    annotation: Option<String>,
+}
+
+/// Handle mouse events for sidebar interaction.
+fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::fs::File>) {
+    log!(
+        logfile,
+        "mouse: kind={:?} row={} col={}",
+        me.kind,
+        me.row,
+        me.column
+    );
+    match me.kind {
+        MouseEventKind::ScrollUp => {
+            if app.active_panel != ActivePanel::None {
+                app.panel_scroll = app.panel_scroll.saturating_sub(1);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.active_panel != ActivePanel::None {
+                let max_scroll = max_panel_scroll(app);
+                app.panel_scroll = app.panel_scroll.saturating_add(1).min(max_scroll);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Check if click is inside the sidebar
+            if let Some(sidebar_rect) = app.last_sidebar_rect {
+                if me.column >= sidebar_rect.x
+                    && me.column < sidebar_rect.x + sidebar_rect.width
+                    && me.row >= sidebar_rect.y
+                    && me.row < sidebar_rect.y + sidebar_rect.height
+                {
+                    // Clicked inside sidebar — determine which item was clicked
+                    handle_sidebar_click(app, me.row, sidebar_rect, logfile);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Calculate the maximum scroll offset for the current panel.
+/// Prevents scrolling past the last visible item.
+fn max_panel_scroll(app: &App) -> u16 {
+    if app.panel_item_count == 0 || app.last_sidebar_rect.is_none() {
+        return 0;
+    }
+    let sidebar_height = app
+        .last_sidebar_rect
+        .map(|r| r.height)
+        .unwrap_or(0);
+    let total_content = app.panel_click_header + app.panel_item_count as u16;
+    total_content.saturating_sub(sidebar_height)
+}
+
+/// Handle a click inside the sidebar area.
+fn handle_sidebar_click(
+    app: &mut App,
+    row: u16,
+    sidebar_rect: Rect,
+    logfile: &mut Option<std::fs::File>,
+) {
+    // Convert absolute row to panel-relative row, then add scroll offset
+    // to account for the Paragraph's .scroll() displacement
+    let item_row = row.saturating_sub(sidebar_rect.y).saturating_add(app.panel_scroll);
+
+    match app.active_panel {
+        ActivePanel::Regions => {
+            let header = app.panel_click_header;
+            if item_row >= header && app.panel_item_count > 0 {
+                let region_idx = (item_row - header) as usize;
+                if region_idx < app.panel_item_count {
+                    app.focused_region = region_idx;
+                    log!(
+                        logfile,
+                        "sidebar_click: panel=Regions region_idx={}",
+                        region_idx
+                    );
+                }
+            }
+        }
+        ActivePanel::ChainInfo => {
+            let header = app.panel_click_header;
+            if item_row >= header && app.panel_item_count > 0 {
+                let chain_idx = (item_row - header) as usize;
+                if chain_idx < app.panel_item_count {
+                    app.current_chain = chain_idx;
+                    log!(
+                        logfile,
+                        "sidebar_click: panel=ChainInfo chain_idx={}",
+                        chain_idx
+                    );
+                    if app.active_panel == ActivePanel::Interface {
+                        // Trigger interface color rebuild if needed
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn main() -> Result<()> {
@@ -275,12 +378,25 @@ fn main() -> Result<()> {
         }
     }
 
+    // Load annotation JSON if provided
+    if let Some(ann_path) = &cli.annotation {
+        app.load_annotation(ann_path);
+        log!(logfile, "annotation: loaded from '{}'", ann_path);
+    }
+
+    // Enable mouse capture for sidebar interaction
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::EnableMouseCapture
+    )?;
+
     log!(
         logfile,
-        "app created: render_mode={:?} chains={} zoom={:.2}",
+        "app created: render_mode={:?} chains={} zoom={:.2} active_panel={:?}",
         app.render_mode,
         app.protein.chains.len(),
-        app.camera.zoom
+        app.camera.zoom,
+        app.active_panel
     );
 
     // Spawn dedicated input thread — decouples input from rendering so
@@ -350,7 +466,15 @@ fn main() -> Result<()> {
                         KeyCode::Char('[') => app.prev_chain(),
                         KeyCode::Char(']') => app.next_chain(),
                         KeyCode::Char(' ') => app.camera.auto_rotate = !app.camera.auto_rotate,
-                        KeyCode::Char('f') => app.toggle_interface(),
+                        KeyCode::Tab => {
+                            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                                app.cycle_panel_prev();
+                            } else {
+                                app.cycle_panel_next();
+                            }
+                        }
+                        KeyCode::Char('f') => app.close_panel(),
+                        KeyCode::Char('F') => app.toggle_interface(),
                         KeyCode::Char('I') => app.toggle_interactions(),
                         KeyCode::Char('g') => app.toggle_ligands(),
                         KeyCode::Char('?') => app.show_help = !app.show_help,
@@ -361,6 +485,9 @@ fn main() -> Result<()> {
                         }
                         _ => {}
                     }
+                }
+                event::AppEvent::Mouse(me) => {
+                    handle_mouse_event(&mut app, me, &mut logfile);
                 }
             }
         }
@@ -404,11 +531,11 @@ fn main() -> Result<()> {
         if frame_count <= 3 || frame_count % 300 == 0 {
             log!(
                 logfile,
-                "frame {} render start (render_mode={:?} viz={:?} interface={} last_draw={:?})",
+                "frame {} render start (render_mode={:?} viz={:?} panel={:?} last_draw={:?})",
                 frame_count,
                 app.render_mode,
                 app.viz_mode,
-                app.show_interface,
+                app.active_panel,
                 last_draw_duration
             );
         }
@@ -427,30 +554,62 @@ fn main() -> Result<()> {
 
         let draw_start = Instant::now();
         terminal.draw(|frame| {
-            // If interface is active, split horizontally: sidebar | main
-            let main_area = if app.show_interface {
+            // Determine sidebar area based on active panel
+            let main_area = if app.active_panel != ActivePanel::None {
+                let sidebar_w = app.active_panel.width();
                 let horiz = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Length(ui::interface_panel::SIDEBAR_WIDTH),
+                        Constraint::Length(sidebar_w),
                         Constraint::Min(20),
                     ])
                     .split(frame.area());
 
-                let summary = app.interface_analysis.summary(&app.protein);
-                let chain_names = app.chain_names();
-                let interaction_counts = app.interface_analysis.interaction_counts();
-                ui::interface_panel::render_interface_panel(
-                    frame,
-                    horiz[0],
-                    &summary,
-                    app.current_chain,
-                    &chain_names,
-                    app.show_interactions,
-                    interaction_counts,
-                );
+                // Store sidebar rect for mouse hit-testing
+                app.last_sidebar_rect = Some(horiz[0]);
+
+                let sidebar_area = horiz[0];
+                match app.active_panel {
+                    ActivePanel::Interface => {
+                        let summary = app.interface_analysis.summary(&app.protein);
+                        let chain_names = app.chain_names();
+                        let interaction_counts = app.interface_analysis.interaction_counts();
+                        ui::interface_panel::render_interface_panel(
+                            frame,
+                            sidebar_area,
+                            &summary,
+                            app.current_chain,
+                            &chain_names,
+                            app.show_interactions,
+                            interaction_counts,
+                        );
+                    }
+                    ActivePanel::Regions => {
+                        ui::regions_panel::render_regions_panel(
+                            frame,
+                            sidebar_area,
+                            &mut app,
+                        );
+                    }
+                    ActivePanel::Iteration => {
+                        ui::iteration_panel::render_iteration_panel(
+                            frame,
+                            sidebar_area,
+                            &app,
+                        );
+                    }
+                    ActivePanel::ChainInfo => {
+                        ui::chain_info_panel::render_chain_info_panel(
+                            frame,
+                            sidebar_area,
+                            &mut app,
+                        );
+                    }
+                    ActivePanel::None => unreachable!(),
+                }
                 horiz[1]
             } else {
+                app.last_sidebar_rect = None;
                 frame.area()
             };
 
@@ -500,6 +659,7 @@ fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -512,9 +672,10 @@ fn main() -> Result<()> {
             .map(|c| c.id.as_str())
             .unwrap_or("?");
         let viz_name = app.viz_mode.name();
-        let color_name = match app.show_interface {
-            true => "Interface",
-            false => match &app.color_scheme.scheme_type {
+        let color_name = if app.active_panel == ActivePanel::Interface {
+            "Interface"
+        } else {
+            match &app.color_scheme.scheme_type {
                 render::color::ColorSchemeType::Structure => "Structure",
                 render::color::ColorSchemeType::Chain => "Chain",
                 render::color::ColorSchemeType::Element => "Element",
@@ -522,13 +683,13 @@ fn main() -> Result<()> {
                 render::color::ColorSchemeType::Rainbow => "Rainbow",
                 render::color::ColorSchemeType::Plddt => "Plddt",
                 render::color::ColorSchemeType::Interface => "Interface",
-            },
+            }
         };
         let render_name = app.render_mode.name();
         let (rot_x, rot_y, rot_z) = app.camera.euler_angles();
         let m = app.camera.rotation_matrix();
         let state_json = format!(
-            "{{\n  \"focused_chain\": \"{}\",\n  \"viz_mode\": \"{}\",\n  \"color_scheme\": \"{}\",\n  \"render_mode\": \"{}\",\n  \"camera\": {{ \"rot_x\": {:.6}, \"rot_y\": {:.6}, \"rot_z\": {:.6}, \"zoom\": {:.6}, \"pan_x\": {:.6}, \"pan_y\": {:.6} }},\n  \"rotation_matrix\": [[{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}]],\n  \"interface_active\": {},\n  \"show_interactions\": {},\n  \"show_ligands\": {},\n  \"auto_rotate\": {}\n}}\n",
+            "{{\n  \"focused_chain\": \"{}\",\n  \"viz_mode\": \"{}\",\n  \"color_scheme\": \"{}\",\n  \"render_mode\": \"{}\",\n  \"camera\": {{ \"rot_x\": {:.6}, \"rot_y\": {:.6}, \"rot_z\": {:.6}, \"zoom\": {:.6}, \"pan_x\": {:.6}, \"pan_y\": {:.6} }},\n  \"rotation_matrix\": [[{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}], [{:.15e}, {:.15e}, {:.15e}]],\n  \"active_panel\": \"{}\",\n  \"interface_active\": {},\n  \"show_interactions\": {},\n  \"show_ligands\": {},\n  \"auto_rotate\": {}\n}}\n",
             focused_chain,
             viz_name,
             color_name,
@@ -542,7 +703,8 @@ fn main() -> Result<()> {
             m[0][0], m[0][1], m[0][2],
             m[1][0], m[1][1], m[1][2],
             m[2][0], m[2][1], m[2][2],
-            app.show_interface,
+            app.active_panel.name(),
+            app.active_panel == ActivePanel::Interface,
             app.show_interactions,
             app.show_ligands,
             app.camera.auto_rotate,

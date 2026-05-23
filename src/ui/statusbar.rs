@@ -103,7 +103,7 @@ pub fn render_statusbar(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         // Show interactions indicator
-        if app.show_interface && app.show_interactions {
+        if app.active_panel == crate::app::ActivePanel::Interface && app.show_interactions {
             spans.push(Span::styled(
                 "\u{2502} ",
                 Style::default().fg(Color::DarkGray),

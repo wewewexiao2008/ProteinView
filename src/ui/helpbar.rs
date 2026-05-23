@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 /// Render the keybinding hints bar at the bottom
 pub fn render_helpbar(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(Line::from(vec![
-        Span::styled("╰── ", Style::default().fg(Color::DarkGray)),
+        Span::styled("\u{2570}\u{2500}\u{2500} ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             "h/l",
             Style::default()
@@ -30,12 +30,19 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect) {
         ),
         Span::styled(": zoom  ", Style::default().fg(Color::Gray)),
         Span::styled(
-            "wasd",
+            "Tab",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(": pan  ", Style::default().fg(Color::Gray)),
+        Span::styled(": panels  ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            "f",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(": close  ", Style::default().fg(Color::Gray)),
         Span::styled(
             "c",
             Style::default()
@@ -51,20 +58,6 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect) {
         ),
         Span::styled(": mode  ", Style::default().fg(Color::Gray)),
         Span::styled(
-            "f",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": interface  ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "I",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": interactions  ", Style::default().fg(Color::Gray)),
-        Span::styled(
             "?",
             Style::default()
                 .fg(Color::Cyan)
@@ -72,20 +65,13 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect) {
         ),
         Span::styled(": help  ", Style::default().fg(Color::Gray)),
         Span::styled(
-            "g",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(": ligands  ", Style::default().fg(Color::Gray)),
-        Span::styled(
             "q",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(": quit ", Style::default().fg(Color::Gray)),
-        Span::styled("──╯", Style::default().fg(Color::DarkGray)),
+        Span::styled("\u{2500}\u{2500}\u{256f}", Style::default().fg(Color::DarkGray)),
     ]));
     frame.render_widget(help, area);
 }

@@ -71,7 +71,15 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Prev / next chain"),
         ]),
         Line::from(vec![
+            Span::styled("  Tab        ", Style::default().fg(Color::Yellow)),
+            Span::raw("Cycle sidebar panels"),
+        ]),
+        Line::from(vec![
             Span::styled("  f          ", Style::default().fg(Color::Yellow)),
+            Span::raw("Close current panel"),
+        ]),
+        Line::from(vec![
+            Span::styled("  F          ", Style::default().fg(Color::Yellow)),
             Span::raw("Toggle interface analysis"),
         ]),
         Line::from(vec![

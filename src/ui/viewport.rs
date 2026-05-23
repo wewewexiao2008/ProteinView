@@ -13,7 +13,7 @@ use crate::render::kitty_png::KittyPngImage;
 
 /// Render the main 3D viewport
 pub fn render_viewport(frame: &mut Frame, area: Rect, app: &App) {
-    let interactions: &[Interaction] = if app.show_interface && app.show_interactions {
+    let interactions: &[Interaction] = if app.active_panel == crate::app::ActivePanel::Interface && app.show_interactions {
         &app.interface_analysis.interactions
     } else {
         &[]

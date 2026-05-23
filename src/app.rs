@@ -12,6 +12,116 @@ use crate::render::ribbon::{RibbonTriangle, generate_ribbon_mesh};
 /// optimizations (background interface analysis, backbone default, reduced LOD).
 pub const LARGE_STRUCTURE_THRESHOLD: usize = 5000;
 
+/// Which sidebar panel is active (if any).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivePanel {
+    None,
+    Interface,
+    Regions,
+    Iteration,
+    ChainInfo,
+}
+
+impl ActivePanel {
+    /// All panel variants in tab-cycle order (excluding None).
+    const PANELS: [ActivePanel; 4] = [
+        ActivePanel::Interface,
+        ActivePanel::Regions,
+        ActivePanel::Iteration,
+        ActivePanel::ChainInfo,
+    ];
+
+    /// Advance to the next panel in the cycle.
+    pub fn next(self) -> Self {
+        match self {
+            Self::None => Self::PANELS[0],
+            _ => {
+                let idx = Self::PANELS.iter().position(|&p| p == self).unwrap_or(0);
+                let next_idx = (idx + 1) % Self::PANELS.len();
+                Self::PANELS[next_idx]
+            }
+        }
+    }
+
+    /// Go back to the previous panel in the cycle.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::None => Self::PANELS[Self::PANELS.len() - 1],
+            _ => {
+                let idx = Self::PANELS.iter().position(|&p| p == self).unwrap_or(0);
+                let prev_idx = (idx + Self::PANELS.len() - 1) % Self::PANELS.len();
+                Self::PANELS[prev_idx]
+            }
+        }
+    }
+
+    /// Sidebar width in columns for this panel.
+    pub fn width(self) -> u16 {
+        match self {
+            Self::None => 0,
+            Self::Interface => crate::ui::interface_panel::SIDEBAR_WIDTH,
+            Self::Regions | Self::Iteration | Self::ChainInfo => 34,
+        }
+    }
+
+    /// Human-readable panel name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Interface => "Interface",
+            Self::Regions => "Regions",
+            Self::Iteration => "Iteration",
+            Self::ChainInfo => "ChainInfo",
+        }
+    }
+}
+
+/// Annotation data loaded from a JSON file passed via `--annotation`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Annotation {
+    #[serde(default)]
+    pub editspec_regions: Option<Vec<EditSpecRegion>>,
+    #[serde(default)]
+    pub iteration: Option<IterationInfo>,
+    #[serde(default)]
+    pub highlights: Option<HighlightInfo>,
+}
+
+/// A single EditSpec region in the annotation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EditSpecRegion {
+    pub chain: String,
+    pub range: [usize; 2],
+    pub action: String,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Iteration progress info in the annotation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct IterationInfo {
+    pub current: u32,
+    pub total: u32,
+    #[serde(default)]
+    pub best_sc_tm: Option<f64>,
+    #[serde(default)]
+    pub best_plddt: Option<f64>,
+    #[serde(default)]
+    pub candidates: Option<u32>,
+    #[serde(default)]
+    pub high_quality: Option<u32>,
+}
+
+/// Highlight residues in the annotation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HighlightInfo {
+    pub chain: String,
+    #[serde(default)]
+    pub residues: Vec<usize>,
+    #[serde(default)]
+    pub highlight_type: Option<String>,
+}
+
 /// Visualization mode
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VizMode {
@@ -106,7 +216,8 @@ pub struct App {
     pub render_mode: RenderMode,
     pub show_help: bool,
     pub show_ligands: bool,
-    pub show_interface: bool,
+    /// Which sidebar panel is currently active (replaces the old `show_interface` bool).
+    pub active_panel: ActivePanel,
     pub show_interactions: bool,
     pub interface_analysis: InterfaceAnalysis,
     pub should_quit: bool,
@@ -142,6 +253,20 @@ pub struct App {
     /// Cached result of `total_residues > LARGE_STRUCTURE_THRESHOLD`, set once
     /// in `App::new` to avoid per-frame O(n) `residue_count()` calls.
     pub is_large: bool,
+    /// Annotation data loaded from `--annotation` JSON file.
+    pub annotation: Option<Annotation>,
+    /// Index of the focused region in the Regions panel.
+    pub focused_region: usize,
+    /// Scroll offset for the active sidebar panel (in lines).
+    pub panel_scroll: u16,
+    /// Stored sidebar layout rect for mouse hit-testing.
+    pub last_sidebar_rect: Option<ratatui::layout::Rect>,
+    /// Number of header lines before the first clickable item in the active panel.
+    /// Updated during each draw call so mouse click mapping stays accurate.
+    pub panel_click_header: u16,
+    /// Total number of clickable items in the active panel.
+    /// Used to clamp scroll offset and validate click targets.
+    pub panel_item_count: usize,
 }
 
 impl App {
@@ -265,7 +390,7 @@ impl App {
             render_mode,
             show_help: false,
             show_ligands: true,
-            show_interface: false,
+            active_panel: ActivePanel::None,
             show_interactions: false,
             interface_analysis,
             should_quit: false,
@@ -281,11 +406,17 @@ impl App {
             interface_computed,
             interface_rx,
             is_large,
+            annotation: None,
+            focused_region: 0,
+            panel_scroll: 0,
+            last_sidebar_rect: None,
+            panel_click_header: 0,
+            panel_item_count: 0,
         }
     }
 
     pub fn cycle_color(&mut self) {
-        if self.show_interface {
+        if self.active_panel == ActivePanel::Interface {
             // While interface mode is active, cycle the saved scheme so the
             // user's preference is tracked, but keep displaying Interface colors.
             self.saved_color_scheme_type = self.saved_color_scheme_type.next(self.has_plddt);
@@ -342,8 +473,18 @@ impl App {
     }
 
     pub fn toggle_interface(&mut self) {
-        self.show_interface = !self.show_interface;
-        if self.show_interface {
+        if self.active_panel == ActivePanel::Interface {
+            // Close the interface panel.
+            self.active_panel = ActivePanel::None;
+            self.show_interactions = false;
+            // Restore the user's saved color scheme instead of hardcoding Structure
+            self.color_scheme =
+                ColorScheme::new(self.saved_color_scheme_type, self.protein.residue_count());
+            self.mesh_dirty = true;
+        } else {
+            // Open the interface panel.
+            self.active_panel = ActivePanel::Interface;
+            self.panel_scroll = 0;
             // Check if background analysis is ready, otherwise compute synchronously.
             if !self.interface_computed {
                 // Determine background thread status without holding a
@@ -359,7 +500,7 @@ impl App {
                         // Still computing — don't enter interface mode yet.
                         // poll_background_interface() will absorb the result
                         // when ready; the user can press `f` again.
-                        self.show_interface = false;
+                        self.active_panel = ActivePanel::None;
                         return;
                     }
                     Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -384,23 +525,117 @@ impl App {
             // Save the user's current color scheme before switching to Interface
             self.saved_color_scheme_type = self.color_scheme.scheme_type;
             self.rebuild_interface_colors();
-        } else {
-            self.show_interactions = false;
-            // Restore the user's saved color scheme instead of hardcoding Structure
-            self.color_scheme =
-                ColorScheme::new(self.saved_color_scheme_type, self.protein.residue_count());
-            self.mesh_dirty = true;
         }
     }
 
     pub fn toggle_interactions(&mut self) {
-        if self.show_interface {
+        if self.active_panel == ActivePanel::Interface {
             self.show_interactions = !self.show_interactions;
         }
     }
 
     pub fn toggle_ligands(&mut self) {
         self.show_ligands = !self.show_ligands;
+    }
+
+    /// Cycle to the next sidebar panel (Tab binding).
+    pub fn cycle_panel_next(&mut self) {
+        let prev = self.active_panel;
+        self.active_panel = self.active_panel.next();
+        if self.active_panel == ActivePanel::Interface && prev != ActivePanel::Interface {
+            // Entering interface — ensure analysis is computed and apply interface colors.
+            self.ensure_interface_analysis();
+            self.saved_color_scheme_type = self.color_scheme.scheme_type;
+            self.rebuild_interface_colors();
+        } else if prev == ActivePanel::Interface && self.active_panel != ActivePanel::Interface {
+            // Leaving interface — restore saved colors.
+            self.show_interactions = false;
+            self.color_scheme =
+                ColorScheme::new(self.saved_color_scheme_type, self.protein.residue_count());
+            self.mesh_dirty = true;
+        }
+        self.panel_scroll = 0;
+    }
+
+    /// Cycle to the previous sidebar panel (Shift+Tab binding).
+    pub fn cycle_panel_prev(&mut self) {
+        let prev = self.active_panel;
+        self.active_panel = self.active_panel.prev();
+        if self.active_panel == ActivePanel::Interface && prev != ActivePanel::Interface {
+            self.ensure_interface_analysis();
+            self.saved_color_scheme_type = self.color_scheme.scheme_type;
+            self.rebuild_interface_colors();
+        } else if prev == ActivePanel::Interface && self.active_panel != ActivePanel::Interface {
+            self.show_interactions = false;
+            self.color_scheme =
+                ColorScheme::new(self.saved_color_scheme_type, self.protein.residue_count());
+            self.mesh_dirty = true;
+        }
+        self.panel_scroll = 0;
+    }
+
+    /// Close the current sidebar panel (f binding).
+    pub fn close_panel(&mut self) {
+        if self.active_panel == ActivePanel::Interface {
+            self.show_interactions = false;
+            self.color_scheme =
+                ColorScheme::new(self.saved_color_scheme_type, self.protein.residue_count());
+            self.mesh_dirty = true;
+        }
+        self.active_panel = ActivePanel::None;
+        self.panel_scroll = 0;
+    }
+
+    /// Ensure interface analysis is computed, starting background or sync as needed.
+    fn ensure_interface_analysis(&mut self) {
+        if self.interface_computed {
+            return;
+        }
+        let bg_status = self.interface_rx.as_ref().map(|rx| rx.try_recv());
+        match bg_status {
+            Some(Ok(ia)) => {
+                self.interface_analysis = ia;
+                self.interface_computed = true;
+                self.interface_rx = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                // Still computing — toggle_interface will handle this.
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.interface_rx = None;
+                let mut ia = analyze_interface(&self.protein, 4.5);
+                if !self.protein.ligands.is_empty() {
+                    ia.binding_pockets = Some(analyze_binding_pockets(&self.protein, 4.5));
+                }
+                self.interface_analysis = ia;
+                self.interface_computed = true;
+            }
+            None => {
+                let mut ia = analyze_interface(&self.protein, 4.5);
+                if !self.protein.ligands.is_empty() {
+                    ia.binding_pockets = Some(analyze_binding_pockets(&self.protein, 4.5));
+                }
+                self.interface_analysis = ia;
+                self.interface_computed = true;
+            }
+        }
+    }
+
+    /// Load an annotation JSON file from disk.
+    pub fn load_annotation(&mut self, path: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str::<Annotation>(&content) {
+                Ok(ann) => {
+                    self.annotation = Some(ann);
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to parse annotation '{}': {}", path, e);
+                }
+            },
+            Err(e) => {
+                eprintln!("Warning: failed to read annotation '{}': {}", path, e);
+            }
+        }
     }
 
     /// Get the cached ribbon mesh, regenerating if dirty.
@@ -415,7 +650,7 @@ impl App {
     pub fn next_chain(&mut self) {
         if !self.protein.chains.is_empty() {
             self.current_chain = (self.current_chain + 1) % self.protein.chains.len();
-            if self.show_interface {
+            if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
         }
@@ -428,7 +663,7 @@ impl App {
             } else {
                 self.current_chain - 1
             };
-            if self.show_interface {
+            if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
         }
