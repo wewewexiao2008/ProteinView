@@ -68,6 +68,14 @@ struct Cli {
     /// Number of render threads (default: 4)
     #[arg(long, default_value = "4")]
     threads: usize,
+
+    /// Export viewer state to a JSON file on exit (for external integration)
+    #[arg(long)]
+    state_file: Option<String>,
+
+    /// Focus on a specific chain by name at startup
+    #[arg(long)]
+    focus_chain: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -248,6 +256,25 @@ fn main() -> Result<()> {
         term_rows,
         picker,
     );
+    // Apply --focus-chain: set initial chain by name
+    if let Some(chain_name) = &cli.focus_chain {
+        let idx = app
+            .protein
+            .chains
+            .iter()
+            .position(|c| &c.id == chain_name);
+        if let Some(i) = idx {
+            app.current_chain = i;
+            log!(logfile, "focus_chain: set to '{}' (index {})", chain_name, i);
+        } else {
+            eprintln!(
+                "Warning: chain '{}' not found (available: {})",
+                chain_name,
+                app.protein.chains.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
     log!(
         logfile,
         "app created: render_mode={:?} chains={} zoom={:.2}",
@@ -475,6 +502,56 @@ fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Export viewer state if --state-file was provided
+    if let Some(state_path) = &cli.state_file {
+        let focused_chain = app
+            .protein
+            .chains
+            .get(app.current_chain)
+            .map(|c| c.id.as_str())
+            .unwrap_or("?");
+        let viz_name = app.viz_mode.name();
+        let color_name = match app.show_interface {
+            true => "Interface",
+            false => match &app.color_scheme.scheme_type {
+                render::color::ColorSchemeType::Structure => "Structure",
+                render::color::ColorSchemeType::Chain => "Chain",
+                render::color::ColorSchemeType::Element => "Element",
+                render::color::ColorSchemeType::BFactor => "BFactor",
+                render::color::ColorSchemeType::Rainbow => "Rainbow",
+                render::color::ColorSchemeType::Plddt => "Plddt",
+                render::color::ColorSchemeType::Interface => "Interface",
+            },
+        };
+        let render_name = app.render_mode.name();
+        let state_json = format!(
+            "{{\n  \"focused_chain\": \"{}\",\n  \"viz_mode\": \"{}\",\n  \"color_scheme\": \"{}\",\n  \"render_mode\": \"{}\",\n  \"camera\": {{ \"rot_x\": {:.6}, \"rot_y\": {:.6}, \"rot_z\": {:.6}, \"zoom\": {:.6}, \"pan_x\": {:.6}, \"pan_y\": {:.6} }},\n  \"interface_active\": {},\n  \"show_interactions\": {},\n  \"show_ligands\": {},\n  \"auto_rotate\": {}\n}}\n",
+            focused_chain,
+            viz_name,
+            color_name,
+            render_name,
+            app.camera.rot_x,
+            app.camera.rot_y,
+            app.camera.rot_z,
+            app.camera.zoom,
+            app.camera.pan_x,
+            app.camera.pan_y,
+            app.show_interface,
+            app.show_interactions,
+            app.show_ligands,
+            app.camera.auto_rotate,
+        );
+        use std::io::Write;
+        match std::fs::File::create(state_path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(state_json.as_bytes()) {
+                    eprintln!("Warning: failed to write state file: {}", e);
+                }
+            }
+            Err(e) => eprintln!("Warning: failed to create state file '{}': {}", state_path, e),
+        }
+    }
 
     Ok(())
 }
