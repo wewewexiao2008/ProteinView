@@ -1061,13 +1061,18 @@ impl App {
     }
 
     /// Enter edit mode for an existing region (Enter key on a region).
+    /// If there are no regions, delegates to `edit_region_add()` instead.
     pub fn edit_region_start(&mut self) {
         if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return;
         }
         let regions = match self.annotation.as_ref().and_then(|a| a.editspec_regions.as_ref()) {
-            Some(r) => r,
-            None => return,
+            Some(r) if !r.is_empty() => r,
+            _ => {
+                // No regions defined yet — treat Enter same as `a` (add new region).
+                self.edit_region_add();
+                return;
+            }
         };
         let idx = self.focused_region.min(regions.len().saturating_sub(1));
         let region = &regions[idx];
@@ -1091,13 +1096,23 @@ impl App {
         if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
             return;
         }
-        // Default chain is the first protein chain, or "A" if no chains.
+        // Default chain is the current protein chain, or first chain.
         let default_chain = self
             .protein
             .chains
-            .first()
+            .get(self.current_chain)
             .map(|c| c.id.clone())
+            .or_else(|| self.protein.chains.first().map(|c| c.id.clone()))
             .unwrap_or_else(|| "A".to_string());
+
+        // Default range end is the current chain's residue count, or 10 as fallback.
+        let default_range_end = self
+            .protein
+            .chains
+            .get(self.current_chain)
+            .map(|c| c.residues.len())
+            .unwrap_or(10)
+            .max(1);
 
         self.edit_state = EditState {
             editing: true,
@@ -1105,7 +1120,7 @@ impl App {
             cursor_field: EditField::Chain,
             draft_chain: default_chain,
             draft_range_start: 1,
-            draft_range_end: 10,
+            draft_range_end: default_range_end,
             draft_action: "edit".to_string(),
             draft_label: String::new(),
             validation_error: None,

@@ -466,8 +466,13 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
             _ => {
+                // No regions defined — show helpful hint.
                 lines.push(Line::from(Span::styled(
-                    " No region data in annotation",
+                    " No regions defined",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " Press 'a' to add a region",
                     Style::default().fg(Color::DarkGray),
                 )));
                 if is_editing && app.edit_state.editing_region_idx.is_none() {
@@ -476,12 +481,13 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         },
         None => {
+            // No annotation loaded — user can still add regions from scratch.
             lines.push(Line::from(Span::styled(
-                " No annotation loaded",
+                " No regions defined",
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
-                " Use --annotation <file>",
+                " Press 'a' to add a region",
                 Style::default().fg(Color::DarkGray),
             )));
             if is_editing && app.edit_state.editing_region_idx.is_none() {

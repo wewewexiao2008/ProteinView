@@ -129,13 +129,15 @@ fn handle_editspec_view_key(
         // j/k navigate regions (only when Regions panel is active and not editing).
         KeyCode::Char('j') | KeyCode::Down => {
             app.edit_state.delete_confirm = false;
-            if let Some(ref ann) = app.annotation {
-                if let Some(ref regions) = ann.editspec_regions {
-                    if !regions.is_empty() {
-                        app.focused_region =
-                            (app.focused_region + 1).min(regions.len() - 1);
-                    }
-                }
+            let region_count = app
+                .annotation
+                .as_ref()
+                .and_then(|a| a.editspec_regions.as_ref())
+                .map(|r| r.len())
+                .unwrap_or(0);
+            if region_count > 0 {
+                app.focused_region =
+                    (app.focused_region + 1).min(region_count - 1);
             }
             true
         }
