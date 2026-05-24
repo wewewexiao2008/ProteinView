@@ -166,11 +166,13 @@ fn handle_edit_mode_key(
     use app::EditField;
 
     match key.code {
-        // Tab / Shift+Tab: move between fields.
+        // BackTab (Shift+Tab in most terminals): move to previous field.
+        KeyCode::BackTab => {
+            app.edit_prev_field();
+        }
+        // Tab: move to next field (or cycle labels in label field).
         KeyCode::Tab => {
-            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
-                app.edit_prev_field();
-            } else if app.edit_state.cursor_field == EditField::Label {
+            if app.edit_state.cursor_field == EditField::Label {
                 // In label field, Tab cycles predefined labels.
                 app.edit_cycle_label();
             } else {
@@ -828,12 +830,14 @@ fn main() -> Result<()> {
                         KeyCode::Char('[') => app.prev_chain(),
                         KeyCode::Char(']') => app.next_chain(),
                         KeyCode::Char(' ') => app.camera.auto_rotate = !app.camera.auto_rotate,
+                        KeyCode::BackTab => {
+                            app.cycle_panel_prev();
+                        }
                         KeyCode::Tab => {
-                            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
-                                app.cycle_panel_prev();
-                            } else {
-                                app.cycle_panel_next();
-                            }
+                            app.cycle_panel_next();
+                        }
+                        KeyCode::Backspace => {
+                            app.cycle_panel_prev();
                         }
                         KeyCode::Char('f') => app.close_panel(),
                         KeyCode::Char('F') => app.toggle_interface(),
