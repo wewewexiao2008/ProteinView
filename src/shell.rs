@@ -2,7 +2,7 @@
 //!
 //! ProteinView is the 3D engine; this module is the Studio session chrome:
 //! Workflow | Tree | View | EditSpec, plus one interaction-mode router
-//! (View | Select | EditRegion | Run). Tree and Workflow are empty shells.
+//! (View | Select | EditRegion | Run). Workflow stays an empty shell.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -120,6 +120,11 @@ pub enum KeyAction {
     EditFormBackspace,
     EditFormChar(char),
     RunIgnore,
+    TreeNext,
+    TreePrev,
+    TreeCollapse,
+    TreeExpand,
+    TreeActivate,
     Ignore,
 }
 
@@ -144,6 +149,16 @@ impl Shell {
         Self {
             focused: PaneId::View,
             expanded: [false, false, true, true],
+            mode: InteractionMode::View,
+            previous_mode: InteractionMode::View,
+        }
+    }
+
+    /// Campaign directory: land on the product tree. View stays open for row→3D.
+    pub fn campaign_session() -> Self {
+        Self {
+            focused: PaneId::Tree,
+            expanded: [false, true, true, true],
             mode: InteractionMode::View,
             previous_mode: InteractionMode::View,
         }
@@ -199,6 +214,10 @@ impl Shell {
     pub fn view_focused(&self) -> bool {
         self.focused == PaneId::View
     }
+
+    pub fn tree_focused(&self) -> bool {
+        self.focused == PaneId::Tree
+    }
 }
 
 fn pane_index(pane: PaneId) -> usize {
@@ -217,7 +236,8 @@ pub const KEY_TABLE: &[(&str, &str)] = &[
     ("q", "Quit (View mode only)"),
     ("h/l j/k w/a/s/d u/i [ ] v", "3D camera / viz (View mode; j/k rotate only when View is focused)"),
     ("x", "Enter Select (sequence-selection contract)"),
-    ("Enter", "Open EditRegion form (empty, or prefilled from an active selection)"),
+    ("Enter", "Tree: load the row's structure in View; otherwise open EditRegion form"),
+    ("Tree: j/k h/l Enter", "Move / collapse / expand / load structure_path into View"),
     ("e", "Edit the focused existing region"),
     ("Ctrl+R", "Open Run overlay (View mode only; ignored in other modes)"),
     ("Select: h/l H/L s [ ] 1-5", "Sequence cursor / boundary / segment / action shortcuts"),
@@ -312,12 +332,15 @@ fn route_view(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool) -> 
         KeyCode::Char('q') => KeyAction::Quit,
         KeyCode::Char('c') if ctrl => KeyAction::Quit,
         KeyCode::Char('x') => KeyAction::EnterSelect,
+        KeyCode::Enter if shell.tree_focused() => KeyAction::TreeActivate,
         KeyCode::Enter => KeyAction::OpenEmptyForm,
         KeyCode::Char('e') => KeyAction::EditFocusedRegion,
         KeyCode::Esc if has_selection => KeyAction::ClearSelection,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('j') | KeyCode::Down => {
-            if shell.editspec_focused() {
+            if shell.tree_focused() {
+                KeyAction::TreeNext
+            } else if shell.editspec_focused() {
                 KeyAction::RegionNext
             } else if shell.view_focused() {
                 KeyAction::RotateX(1.0)
@@ -326,7 +349,9 @@ fn route_view(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool) -> 
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if shell.editspec_focused() {
+            if shell.tree_focused() {
+                KeyAction::TreePrev
+            } else if shell.editspec_focused() {
                 KeyAction::RegionPrev
             } else if shell.view_focused() {
                 KeyAction::RotateX(-1.0)
@@ -335,14 +360,18 @@ fn route_view(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool) -> 
             }
         }
         KeyCode::Char('h') | KeyCode::Left => {
-            if shell.view_focused() {
+            if shell.tree_focused() {
+                KeyAction::TreeCollapse
+            } else if shell.view_focused() {
                 KeyAction::RotateY(-1.0)
             } else {
                 KeyAction::Ignore
             }
         }
         KeyCode::Char('l') | KeyCode::Right => {
-            if shell.view_focused() {
+            if shell.tree_focused() {
+                KeyAction::TreeExpand
+            } else if shell.view_focused() {
                 KeyAction::RotateY(1.0)
             } else {
                 KeyAction::Ignore
@@ -498,6 +527,37 @@ mod tests {
         assert!(!shell.is_expanded(PaneId::Tree));
         assert!(shell.is_expanded(PaneId::View));
         assert!(shell.is_expanded(PaneId::EditSpec));
+    }
+
+    #[test]
+    fn campaign_session_lands_on_tree() {
+        let shell = Shell::campaign_session();
+        assert_eq!(shell.focused, PaneId::Tree);
+        assert!(shell.is_expanded(PaneId::Tree));
+        assert!(shell.is_expanded(PaneId::View));
+        assert!(!shell.is_expanded(PaneId::Workflow));
+    }
+
+    #[test]
+    fn tree_focus_enter_activates_row_not_editspec_form() {
+        let mut shell = Shell::campaign_session();
+        assert_eq!(
+            route_key(&shell, key(KeyCode::Enter), false, false),
+            KeyAction::TreeActivate
+        );
+        assert_eq!(
+            route_key(&shell, key(KeyCode::Char('j')), false, false),
+            KeyAction::TreeNext
+        );
+        assert_eq!(
+            route_key(&shell, key(KeyCode::Char('h')), false, false),
+            KeyAction::TreeCollapse
+        );
+        shell.focus(PaneId::View);
+        assert_eq!(
+            route_key(&shell, key(KeyCode::Enter), false, false),
+            KeyAction::OpenEmptyForm
+        );
     }
 
     #[test]

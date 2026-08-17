@@ -4,6 +4,7 @@ use ratatui::style::Color;
 use ratatui_image::picker::Picker;
 
 use crate::bridge::GemlibBridge;
+use crate::product_tree::{ProductTree, StudioSeed, resolve_structure_path};
 use crate::edit_history::{
     EditHistory, HistoryEntry, ValidationIssue, validate_regions,
 };
@@ -620,6 +621,10 @@ pub struct App {
     pub last_workflow_rect: Option<ratatui::layout::Rect>,
     pub last_tree_rect: Option<ratatui::layout::Rect>,
     pub last_view_rect: Option<ratatui::layout::Rect>,
+    pub product_tree: ProductTree,
+    pub tree_cursor: usize,
+    pub campaign_root: Option<String>,
+    pub loaded_structure_path: Option<String>,
 }
 
 impl App {
@@ -795,7 +800,91 @@ impl App {
             last_workflow_rect: None,
             last_tree_rect: None,
             last_view_rect: None,
+            product_tree: ProductTree::default(),
+            tree_cursor: 0,
+            campaign_root: None,
+            loaded_structure_path: None,
         }
+    }
+
+    pub fn apply_studio_seed(&mut self, seed: StudioSeed) {
+        self.campaign_root = seed
+            .campaign_root
+            .or_else(|| seed.product_tree.campaign_root.clone());
+        self.product_tree = seed.product_tree;
+        self.tree_cursor = 0;
+        if !self.product_tree.is_empty() {
+            self.shell = Shell::campaign_session();
+        }
+    }
+
+    pub fn tree_visible_count(&self) -> usize {
+        self.product_tree.visible_rows().len()
+    }
+
+    pub fn tree_move(&mut self, delta: isize) {
+        let count = self.tree_visible_count();
+        if count == 0 {
+            self.tree_cursor = 0;
+            return;
+        }
+        let next = self.tree_cursor as isize + delta;
+        self.tree_cursor = next.clamp(0, count as isize - 1) as usize;
+    }
+
+    pub fn tree_set_expanded(&mut self, expanded: bool) {
+        let sample_id = self
+            .product_tree
+            .visible_rows()
+            .get(self.tree_cursor)
+            .map(|(_depth, node)| node.sample_id.clone());
+        if let Some(sample_id) = sample_id {
+            self.product_tree.set_expanded(&sample_id, expanded);
+            let count = self.tree_visible_count();
+            if count == 0 {
+                self.tree_cursor = 0;
+            } else if self.tree_cursor >= count {
+                self.tree_cursor = count - 1;
+            }
+        }
+    }
+
+    pub fn replace_protein(&mut self, mut protein: Protein) {
+        protein.center();
+        self.has_plddt = protein.has_plddt();
+        self.protein = protein;
+        self.current_chain = 0;
+        self.mesh_dirty = true;
+        self.needs_clear = true;
+        self.seq_selection.clear();
+        self.color_scheme = ColorScheme::new(self.color_scheme.scheme_type, self.protein.residue_count());
+        self.recalculate_zoom(80, 24);
+    }
+
+    pub fn activate_tree_row(&mut self) -> Result<bool, String> {
+        let row = self
+            .product_tree
+            .visible_rows()
+            .get(self.tree_cursor)
+            .map(|(_depth, node)| {
+                (
+                    node.sample_id.clone(),
+                    node.structure_path.clone(),
+                )
+            });
+        let Some((sample_id, structure_path)) = row else {
+            return Ok(false);
+        };
+        self.product_tree.select(&sample_id);
+        let Some(relative) = structure_path else {
+            return Ok(false);
+        };
+        let path = resolve_structure_path(self.campaign_root.as_deref(), &relative);
+        let protein = crate::parser::pdb::load_structure(path.to_str().unwrap_or_default())
+            .map_err(|err| err.to_string())?;
+        self.replace_protein(protein);
+        self.loaded_structure_path = Some(path.display().to_string());
+        Ok(true)
     }
 
     pub fn cycle_color(&mut self) {

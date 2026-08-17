@@ -4,6 +4,7 @@ mod edit_history;
 mod event;
 mod model;
 mod parser;
+mod product_tree;
 mod render;
 mod shell;
 mod ui;
@@ -286,6 +287,15 @@ fn apply_key_action(
                 _ => app.edit_label_input(ch),
             }
         }
+        KeyAction::TreeNext => app.tree_move(1),
+        KeyAction::TreePrev => app.tree_move(-1),
+        KeyAction::TreeCollapse => app.tree_set_expanded(false),
+        KeyAction::TreeExpand => app.tree_set_expanded(true),
+        KeyAction::TreeActivate => {
+            if let Err(err) = app.activate_tree_row() {
+                log!(logfile, "tree activate failed: {err}");
+            }
+        }
         KeyAction::RunIgnore | KeyAction::Ignore => {}
     }
 }
@@ -325,6 +335,17 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
                 me.row,
             ) {
                 app.shell.focus(pane);
+                if pane == PaneId::Tree {
+                    if let Some(tree_rect) = app.last_tree_rect {
+                        let row = me.row.saturating_sub(tree_rect.y.saturating_add(1)) as usize;
+                        if row < app.tree_visible_count() {
+                            app.tree_cursor = row;
+                            if let Err(err) = app.activate_tree_row() {
+                                log!(logfile, "tree click activate failed: {err}");
+                            }
+                        }
+                    }
+                }
             }
             if let Some(sidebar_rect) = app.last_sidebar_rect {
                 if me.column >= sidebar_rect.x
@@ -653,6 +674,20 @@ fn main() -> Result<()> {
     app.gemlib_bin = cli.gemlib_bin.clone();
     app.output_path = cli.output.clone();
     app.active_panel = ActivePanel::EditSpec;
+    if let Some(state_path) = &cli.state_file {
+        if let Ok(text) = std::fs::read_to_string(state_path) {
+            match product_tree::load_studio_seed(&text) {
+                Ok(seed) => {
+                    let has_tree = !seed.product_tree.is_empty();
+                    app.apply_studio_seed(seed);
+                    if has_tree {
+                        log!(logfile, "product_tree: loaded from '{}'", state_path);
+                    }
+                }
+                Err(err) => log!(logfile, "product_tree: ignored seed ({err})"),
+            }
+        }
+    }
 
     // Enable mouse capture for sidebar interaction
     execute!(

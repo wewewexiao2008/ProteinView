@@ -1,8 +1,8 @@
-//! Empty Tree shell. Campaign sample lineage belongs to studio-product-tree.
+//! Product tree pane. Rows come from gemlib `state.product_tree`.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -18,25 +18,50 @@ pub fn render_tree_pane(frame: &mut Frame, area: Rect, app: &App) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let body = Paragraph::new(vec![
-        Line::from(Span::styled(
-            " Empty shell",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Campaign sample lineage is",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            " 08-18-studio-product-tree.",
-            Style::default().fg(Color::Cyan),
-        )),
-        Line::from(Span::styled(
-            " This session does not render samples.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .wrap(Wrap { trim: false });
+
+    if app.product_tree.is_empty() {
+        let body = Paragraph::new(vec![
+            Line::from(Span::styled(
+                " No campaign tree",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                " Open a v1 campaign directory.",
+                Style::default().fg(Color::Gray),
+            )),
+        ])
+        .wrap(Wrap { trim: false });
+        frame.render_widget(body, inner);
+        return;
+    }
+
+    let rows = app.product_tree.visible_rows();
+    let mut lines = Vec::new();
+    for (idx, (depth, node)) in rows.iter().enumerate() {
+        let marker = if node.children.is_empty() {
+            "  "
+        } else if node.expanded {
+            "▾ "
+        } else {
+            "▸ "
+        };
+        let indent = "  ".repeat(*depth);
+        let selected = app
+            .product_tree
+            .selected_sample_id
+            .as_deref()
+            == Some(node.sample_id.as_str());
+        let cursor = idx == app.tree_cursor;
+        let mut style = Style::default().fg(Color::Gray);
+        if selected {
+            style = style.fg(Color::Cyan);
+        }
+        if cursor {
+            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        }
+        let text = format!("{indent}{marker}{}", node.label);
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(body, inner);
 }
