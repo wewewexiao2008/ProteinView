@@ -1,8 +1,12 @@
+pub mod chrome;
 pub mod editspec_panel;
 pub mod header;
 pub mod help_overlay;
 pub mod helpbar;
 pub mod interface_panel;
 pub mod iteration_panel;
+pub mod run_overlay;
 pub mod statusbar;
+pub mod tree_pane;
 pub mod viewport;
+pub mod workflow_pane;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};

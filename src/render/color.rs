@@ -58,6 +58,8 @@ pub struct ColorScheme {
     focus_chain_id: String,
     /// For Interface mode: set of (chain_id, seq_num) at the interface
     interface_residues_by_id: HashSet<(String, i32)>,
+    /// Transient sequence-selection overlay (chain, seq_start, seq_end inclusive).
+    selection_overlay: Option<(String, i32, i32)>,
 }
 
 impl ColorScheme {
@@ -67,6 +69,7 @@ impl ColorScheme {
             total_residues,
             focus_chain_id: String::new(),
             interface_residues_by_id: HashSet::new(),
+            selection_overlay: None,
         }
     }
 
@@ -86,11 +89,24 @@ impl ColorScheme {
             total_residues,
             focus_chain_id,
             interface_residues_by_id: analysis.interface_residues_by_id_with_protein(protein),
+            selection_overlay: None,
         }
     }
 
+    /// Transient selection highlight overrides the current scheme while active.
+    pub fn set_selection_overlay(&mut self, overlay: Option<(String, i32, i32)>) {
+        self.selection_overlay = overlay;
+    }
+
+    pub const SELECTION_OVERLAY: Color = Color::Rgb(255, 80, 255);
+
     /// Get color for a residue based on current scheme
     pub fn residue_color(&self, residue: &Residue, chain: &Chain) -> Color {
+        if let Some((sel_chain, start, end)) = &self.selection_overlay {
+            if &chain.id == sel_chain && residue.seq_num >= *start && residue.seq_num <= *end {
+                return Self::SELECTION_OVERLAY;
+            }
+        }
         match self.scheme_type {
             ColorSchemeType::Structure => self.structure_color(residue),
             ColorSchemeType::Chain => self.chain_color(chain),
@@ -336,7 +352,7 @@ fn hsv_to_rgb(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::protein::{LigandType, Residue, SecondaryStructure, is_nucleotide};
+    use crate::model::protein::{Chain, LigandType, Residue, SecondaryStructure, is_nucleotide};
 
     /// Build a minimal residue for testing color assignment.
     fn make_residue(name: &str, ss: SecondaryStructure) -> Residue {
@@ -713,5 +729,22 @@ mod tests {
             scheme.ligand_atom_color(&fe_atom, &ligand),
             Color::Rgb(224, 102, 51)
         );
+    }
+
+    #[test]
+    fn selection_overlay_overrides_scheme() {
+        let mut scheme = ColorScheme::new(ColorSchemeType::Structure, 10);
+        let residue = make_residue("ALA", SecondaryStructure::Helix);
+        let chain = Chain {
+            id: "A".to_string(),
+            residues: vec![],
+            molecule_type: crate::model::protein::MoleculeType::Protein,
+        };
+        let base = scheme.residue_color(&residue, &chain);
+        scheme.set_selection_overlay(Some(("A".to_string(), 1, 1)));
+        assert_eq!(scheme.residue_color(&residue, &chain), ColorScheme::SELECTION_OVERLAY);
+        assert_ne!(base, ColorScheme::SELECTION_OVERLAY);
+        scheme.set_selection_overlay(None);
+        assert_eq!(scheme.residue_color(&residue, &chain), base);
     }
 }

@@ -7,6 +7,7 @@ use crate::bridge::GemlibBridge;
 use crate::edit_history::{
     EditHistory, HistoryEntry, ValidationIssue, validate_regions,
 };
+use crate::shell::{self, InteractionMode, Shell, parse_compact_regions, parse_direct_range};
 use crate::model::interface::{InterfaceAnalysis, analyze_binding_pockets, analyze_interface};
 use crate::model::protein::Protein;
 use crate::render::camera::Camera;
@@ -111,6 +112,7 @@ impl ActivePanel {
 /// Which field in the edit form the cursor is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
+    RangeText,
     Chain,
     RangeStart,
     RangeEnd,
@@ -119,11 +121,9 @@ pub enum EditField {
 }
 
 impl EditField {
-    /// All fields in tab order.
-    const FIELDS: [EditField; 5] = [
-        EditField::Chain,
-        EditField::RangeStart,
-        EditField::RangeEnd,
+    /// Direct EditRegion form: typed range, action, label.
+    const FIELDS: [EditField; 3] = [
+        EditField::RangeText,
         EditField::Action,
         EditField::Label,
     ];
@@ -253,7 +253,7 @@ impl SeqSelection {
         if idx < residues.len() {
             self.cursor = idx;
             self.select_segment(residues, idx);
-            self.dragging = false;
+            self.dragging = true;
         }
     }
 
@@ -266,6 +266,32 @@ impl SeqSelection {
         self.end = Some(idx);
         self.active = true;
         self.dragging = true;
+    }
+
+    /// Jump to the previous/next secondary-structure segment.
+    pub fn jump_segment(&mut self, residues: &[crate::model::protein::Residue], dir: i32) {
+        if residues.is_empty() || self.cursor >= residues.len() {
+            return;
+        }
+        let current_ss = residues[self.cursor].secondary_structure;
+        if dir >= 0 {
+            let mut i = self.cursor;
+            while i < residues.len() && residues[i].secondary_structure == current_ss {
+                i += 1;
+            }
+            if i < residues.len() {
+                self.select_segment(residues, i);
+            }
+        } else {
+            let mut i = self.cursor;
+            while i > 0 && residues[i].secondary_structure == current_ss {
+                i -= 1;
+            }
+            if residues[i].secondary_structure == current_ss && i > 0 {
+                i -= 1;
+            }
+            self.select_segment(residues, i);
+        }
     }
 }
 
@@ -295,6 +321,8 @@ pub struct EditState {
     pub editing_region_idx: Option<usize>,
     /// Which field the cursor is on.
     pub cursor_field: EditField,
+    /// Typed range field (`A51-80`, `A:51-80`, or `51-80`).
+    pub draft_range_text: String,
     /// Draft chain letter.
     pub draft_chain: String,
     /// Draft range start.
@@ -316,7 +344,8 @@ impl Default for EditState {
         Self {
             editing: false,
             editing_region_idx: None,
-            cursor_field: EditField::Chain,
+            cursor_field: EditField::RangeText,
+            draft_range_text: String::new(),
             draft_chain: "A".to_string(),
             draft_range_start: 1,
             draft_range_end: 10,
@@ -582,6 +611,15 @@ pub struct App {
     /// Row (within the sidebar) where the sequence line is rendered.
     /// Updated each frame by the editspec panel renderer for mouse hit-testing.
     pub seq_line_row: u16,
+    /// Four-pane Studio chrome and exclusive-focus router.
+    pub shell: Shell,
+    /// Optional `--output` path for compact EditSpec on exit.
+    pub output_path: Option<String>,
+    /// Optional `--gemlib-bin` recorded for Fleet submit (never spawned here).
+    pub gemlib_bin: Option<String>,
+    pub last_workflow_rect: Option<ratatui::layout::Rect>,
+    pub last_tree_rect: Option<ratatui::layout::Rect>,
+    pub last_view_rect: Option<ratatui::layout::Rect>,
 }
 
 impl App {
@@ -751,6 +789,12 @@ impl App {
             seq_selection: SeqSelection::default(),
             mouse_event_count: 0,
             seq_line_row: 0,
+            shell: Shell::pdb_session(),
+            output_path: None,
+            gemlib_bin: None,
+            last_workflow_rect: None,
+            last_tree_rect: None,
+            last_view_rect: None,
         }
     }
 
@@ -989,6 +1033,10 @@ impl App {
     pub fn next_chain(&mut self) {
         if !self.protein.chains.is_empty() {
             self.current_chain = (self.current_chain + 1) % self.protein.chains.len();
+            if self.seq_selection.active {
+                self.seq_selection.clear();
+                self.sync_selection_overlay();
+            }
             if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
@@ -1002,6 +1050,10 @@ impl App {
             } else {
                 self.current_chain - 1
             };
+            if self.seq_selection.active {
+                self.seq_selection.clear();
+                self.sync_selection_overlay();
+            }
             if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
@@ -1177,24 +1229,25 @@ impl App {
     /// Enter edit mode for an existing region (Enter key on a region).
     /// If there are no regions, delegates to `edit_region_add()` instead.
     pub fn edit_region_start(&mut self) {
-        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
+        if self.edit_state.editing {
             return;
         }
         let regions = match self.annotation.as_ref().and_then(|a| a.editspec_regions.as_ref()) {
             Some(r) if !r.is_empty() => r,
             _ => {
-                // No regions defined yet — treat Enter same as `a` (add new region).
-                self.edit_region_add();
+                self.edit_region_open_empty();
                 return;
             }
         };
         let idx = self.focused_region.min(regions.len().saturating_sub(1));
         let region = &regions[idx];
+        let range_text = format!("{}{}-{}", region.chain, region.range[0], region.range[1]);
 
         self.edit_state = EditState {
             editing: true,
             editing_region_idx: Some(idx),
-            cursor_field: EditField::Chain,
+            cursor_field: EditField::RangeText,
+            draft_range_text: range_text,
             draft_chain: region.chain.clone(),
             draft_range_start: region.range[0],
             draft_range_end: region.range[1],
@@ -1203,11 +1256,12 @@ impl App {
             validation_error: None,
             delete_confirm: false,
         };
+        self.shell.enter_mode(InteractionMode::EditRegion);
     }
 
     /// Start adding a new region (a key in EditSpec panel).
     pub fn edit_region_add(&mut self) {
-        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
+        if self.edit_state.editing {
             return;
         }
         // Default chain is the current protein chain, or first chain.
@@ -1231,7 +1285,8 @@ impl App {
         self.edit_state = EditState {
             editing: true,
             editing_region_idx: None,
-            cursor_field: EditField::Chain,
+            cursor_field: EditField::RangeText,
+            draft_range_text: String::new(),
             draft_chain: default_chain,
             draft_range_start: 1,
             draft_range_end: default_range_end,
@@ -1240,12 +1295,59 @@ impl App {
             validation_error: None,
             delete_confirm: false,
         };
+        self.shell.enter_mode(InteractionMode::EditRegion);
+    }
+
+    /// Enter opens an empty form, or a selection-prefilled form when a range is active.
+    pub fn edit_region_open_empty(&mut self) {
+        if self.edit_state.editing {
+            return;
+        }
+        if self.seq_selection.active {
+            self.edit_region_open_from_selection();
+            return;
+        }
+        self.edit_region_add();
+    }
+
+    pub fn edit_region_open_from_selection(&mut self) {
+        if self.edit_state.editing {
+            return;
+        }
+        let Some((start, end)) = self.seq_selection.range() else {
+            self.edit_region_add();
+            return;
+        };
+        let Some(chain) = self.protein.chains.get(self.current_chain) else {
+            self.edit_region_add();
+            return;
+        };
+        if start >= chain.residues.len() || end >= chain.residues.len() {
+            self.edit_region_add();
+            return;
+        }
+        let seq_start = chain.residues[start].seq_num as usize;
+        let seq_end = chain.residues[end].seq_num as usize;
+        self.edit_state = EditState {
+            editing: true,
+            editing_region_idx: None,
+            cursor_field: EditField::Action,
+            draft_range_text: format!("{}{}-{}", chain.id, seq_start, seq_end),
+            draft_chain: chain.id.clone(),
+            draft_range_start: seq_start,
+            draft_range_end: seq_end,
+            draft_action: "edit".to_string(),
+            draft_label: String::new(),
+            validation_error: None,
+            delete_confirm: false,
+        };
+        self.shell.enter_mode(InteractionMode::EditRegion);
     }
 
     /// Delete the focused region (dd -- double d confirmation).
     /// Returns true if the delete was executed (second 'd').
     pub fn edit_region_delete(&mut self) -> bool {
-        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
+        if self.edit_state.editing {
             return false;
         }
 
@@ -1289,7 +1391,7 @@ impl App {
 
     /// Split the focused region at its midpoint (s key in EditSpec panel).
     pub fn edit_region_split(&mut self) {
-        if self.active_panel != ActivePanel::EditSpec || self.edit_state.editing {
+        if self.edit_state.editing {
             return;
         }
 
@@ -1341,6 +1443,7 @@ impl App {
     /// Cancel the current edit operation (Escape key).
     pub fn edit_cancel(&mut self) {
         self.edit_state = EditState::default();
+        self.shell.restore_previous_mode();
     }
 
     /// Move the cursor to the next/previous edit field.
@@ -1412,24 +1515,40 @@ impl App {
         }
     }
 
-    /// Input a character into the label field.
+    /// Input a character into the label or typed-range field.
     pub fn edit_label_input(&mut self, ch: char) {
-        if !self.edit_state.editing || self.edit_state.cursor_field != EditField::Label {
+        if !self.edit_state.editing {
             return;
         }
-        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
-            if self.edit_state.draft_label.len() < 20 {
-                self.edit_state.draft_label.push(ch);
+        match self.edit_state.cursor_field {
+            EditField::Label if ch.is_alphanumeric() || ch == '-' || ch == '_' => {
+                if self.edit_state.draft_label.len() < 20 {
+                    self.edit_state.draft_label.push(ch);
+                }
             }
+            EditField::RangeText if ch.is_ascii_alphanumeric() || ch == '-' || ch == ':' => {
+                if self.edit_state.draft_range_text.len() < 24 {
+                    self.edit_state.draft_range_text.push(ch);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Delete the last character from the label field.
+    /// Delete the last character from the active text field.
     pub fn edit_label_backspace(&mut self) {
-        if !self.edit_state.editing || self.edit_state.cursor_field != EditField::Label {
+        if !self.edit_state.editing {
             return;
         }
-        self.edit_state.draft_label.pop();
+        match self.edit_state.cursor_field {
+            EditField::Label => {
+                self.edit_state.draft_label.pop();
+            }
+            EditField::RangeText => {
+                self.edit_state.draft_range_text.pop();
+            }
+            _ => {}
+        }
     }
 
     /// Cycle through predefined labels for the label field (Tab in label field).
@@ -1451,6 +1570,24 @@ impl App {
     pub fn edit_save(&mut self) -> bool {
         if !self.edit_state.editing {
             return false;
+        }
+
+        let default_chain = self
+            .protein
+            .chains
+            .get(self.current_chain)
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| self.edit_state.draft_chain.clone());
+        match parse_direct_range(&self.edit_state.draft_range_text, &default_chain) {
+            Ok((chain, start, end)) => {
+                self.edit_state.draft_chain = chain;
+                self.edit_state.draft_range_start = start;
+                self.edit_state.draft_range_end = end;
+            }
+            Err(msg) => {
+                self.edit_state.validation_error = Some(msg);
+                return false;
+            }
         }
 
         // Local validation.
@@ -1599,6 +1736,7 @@ impl App {
 
         // Clear edit state.
         self.edit_state = EditState::default();
+        self.shell.restore_previous_mode();
         self.revalidate();
         true
     }
@@ -1688,5 +1826,145 @@ impl App {
         } else {
             None
         }
+    }
+
+    pub fn default_chain_id(&self) -> String {
+        self.protein
+            .chains
+            .get(self.current_chain)
+            .map(|c| c.id.clone())
+            .or_else(|| self.protein.chains.first().map(|c| c.id.clone()))
+            .unwrap_or_else(|| "A".to_string())
+    }
+
+    pub fn enter_select_mode(&mut self) {
+        self.shell.enter_mode(InteractionMode::Select);
+    }
+
+    pub fn enter_run_mode(&mut self) {
+        if self.shell.mode == InteractionMode::View {
+            self.shell.enter_mode(InteractionMode::Run);
+        }
+    }
+
+    pub fn sync_selection_overlay(&mut self) {
+        let overlay = self.selection_overlay_range();
+        self.color_scheme.set_selection_overlay(overlay);
+        self.mesh_dirty = true;
+    }
+
+    pub fn selection_overlay_range(&self) -> Option<(String, i32, i32)> {
+        let (start, end) = self.seq_selection.range()?;
+        let chain = self.protein.chains.get(self.current_chain)?;
+        let start_num = chain.residues.get(start)?.seq_num;
+        let end_num = chain.residues.get(end)?.seq_num;
+        Some((chain.id.clone(), start_num.min(end_num), start_num.max(end_num)))
+    }
+
+    pub fn compact_edit_spec_string(&self) -> Option<String> {
+        let regions = self.annotation.as_ref()?.editspec_regions.as_ref()?;
+        if regions.is_empty() {
+            return None;
+        }
+        let tuples: Vec<(String, usize, usize, String)> = regions
+            .iter()
+            .map(|r| (r.chain.clone(), r.range[0], r.range[1], r.action.clone()))
+            .collect();
+        Some(shell::compact_edit_spec(&tuples))
+    }
+
+    pub fn load_edit_spec_text(&mut self, spec: &str) {
+        match parse_compact_regions(spec) {
+            Ok(parsed) => {
+                let regions = parsed
+                    .into_iter()
+                    .map(|(chain, start, end, action)| EditSpecRegion {
+                        chain,
+                        range: [start, end],
+                        action,
+                        label: None,
+                    })
+                    .collect();
+                self.annotation = Some(Annotation {
+                    editspec_regions: Some(regions),
+                    iteration: None,
+                    highlights: None,
+                });
+                self.revalidate();
+            }
+            Err(e) => eprintln!("Warning: failed to parse --edit '{spec}': {e}"),
+        }
+    }
+
+    pub fn current_residues(&self) -> &[crate::model::protein::Residue] {
+        self.protein
+            .chains
+            .get(self.current_chain)
+            .map(|c| c.residues.as_slice())
+            .unwrap_or(&[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::protein::{Atom, Residue, SecondaryStructure};
+
+    fn residue(seq: i32, ss: SecondaryStructure) -> Residue {
+        Residue {
+            name: "ALA".to_string(),
+            seq_num: seq,
+            atoms: vec![Atom {
+                name: "CA".to_string(),
+                element: "C".to_string(),
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                b_factor: 0.0,
+                is_backbone: true,
+                is_hetero: false,
+            }],
+            secondary_structure: ss,
+        }
+    }
+
+    fn helix_sheet_residues() -> Vec<Residue> {
+        let mut residues = Vec::new();
+        for i in 1..=5 {
+            residues.push(residue(i, SecondaryStructure::Helix));
+        }
+        for i in 6..=8 {
+            residues.push(residue(i, SecondaryStructure::Sheet));
+        }
+        residues
+    }
+
+    #[test]
+    fn click_selects_contiguous_segment() {
+        let residues = helix_sheet_residues();
+        let mut sel = SeqSelection::default();
+        sel.click(&residues, 2);
+        assert_eq!(sel.range(), Some((0, 4)));
+        assert!(sel.active);
+    }
+
+    #[test]
+    fn drag_selects_arbitrary_range() {
+        let residues = helix_sheet_residues();
+        let mut sel = SeqSelection::default();
+        sel.click(&residues, 1);
+        sel.drag_to(6, residues.len());
+        assert_eq!(sel.range(), Some((0, 6)));
+    }
+
+    #[test]
+    fn jump_segment_moves_to_next_ss() {
+        let residues = helix_sheet_residues();
+        let mut sel = SeqSelection::default();
+        sel.cursor = 0;
+        sel.jump_segment(&residues, 1);
+        assert_eq!(sel.range(), Some((5, 7)));
+        sel.jump_segment(&residues, -1);
+        assert_eq!(sel.range(), Some((0, 4)));
     }
 }

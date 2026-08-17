@@ -5,6 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, EditField, PREDEFINED_LABELS, VALID_ACTIONS, label_color};
+use crate::shell::PaneId;
+use crate::ui::chrome::pane_block;
 use crate::edit_history::IssueSeverity;
 use crate::model::protein::{MoleculeType, SecondaryStructure};
 
@@ -229,21 +231,19 @@ fn render_edit_form(lines: &mut Vec<Line<'static>>, app: &App) {
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Line 1: Chain + RangeStart + RangeEnd
-    let chain_active = cursor == EditField::Chain;
-    let rs_active = cursor == EditField::RangeStart;
-    let re_active = cursor == EditField::RangeEnd;
-
+    // Line 1: typed range (A51-80 / A:51-80 / 51-80)
+    let range_active = cursor == EditField::RangeText;
     lines.push(Line::from(vec![
-        field_label("Chain:", chain_active),
+        field_label("Range:", range_active),
         Span::raw(" "),
-        field_value(&es.draft_chain, chain_active),
-        Span::raw(" "),
-        field_label("Range:", rs_active || re_active),
-        Span::raw(" "),
-        field_value(&format!("{}", es.draft_range_start), rs_active),
-        Span::styled("-", Style::default().fg(Color::White)),
-        field_value(&format!("{}", es.draft_range_end), re_active),
+        field_value(
+            if es.draft_range_text.is_empty() {
+                "_"
+            } else {
+                &es.draft_range_text
+            },
+            range_active,
+        ),
     ]));
 
     // Line 2: Action
@@ -792,31 +792,8 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     app.panel_click_header = region_header_lines;
     app.panel_item_count = item_count;
 
-    let issue_count = app.validation_issues.len();
-    let border_title = if is_editing {
-        " EDIT ".to_string()
-    } else if issue_count > 0 {
-        format!(" EditSpec ({} issues) ", issue_count)
-    } else {
-        " EditSpec ".to_string()
-    };
-    let border_color = if is_editing {
-        Color::Yellow
-    } else if issue_count > 0 {
-        let has_error = app.validation_issues.iter().any(|i| i.severity == IssueSeverity::Error);
-        if has_error { Color::Red } else { Color::Yellow }
-    } else {
-        Color::Cyan
-    };
-
     let panel = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(border_title)
-                .title_style(Style::default().fg(border_color)),
-        )
+        .block(pane_block(&app.shell, PaneId::EditSpec))
         .scroll((app.panel_scroll, 0))
         .wrap(Wrap { trim: false });
 
