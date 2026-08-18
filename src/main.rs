@@ -2,6 +2,7 @@ mod app;
 mod bridge;
 mod debug_run;
 mod edit_history;
+mod events;
 mod event;
 mod model;
 mod parser;
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 use app::{
     ActivePanel, App, AppConfig, ConnectionType, ContextTarget, LayoutMode, RenderMode, VizMode,
 };
-use shell::{InteractionMode, KeyAction, Overlay, PaneId, route_key};
+use shell::{KeyAction, Overlay, PaneId, route_key};
 
 macro_rules! log {
     ($file:expr, $($arg:tt)*) => {
@@ -110,15 +111,21 @@ fn apply_key_action(
 ) {
     match action {
         KeyAction::Quit => app.should_quit = true,
-        KeyAction::CyclePaneNext => app.shell.cycle_focus_next(),
-        KeyAction::CyclePanePrev => app.shell.cycle_focus_prev(),
+        KeyAction::CyclePaneNext => {
+            app.shell.cycle_focus_next();
+            app.emit_session_focus();
+        }
+        KeyAction::CyclePanePrev => {
+            app.shell.cycle_focus_prev();
+            app.emit_session_focus();
+        }
         KeyAction::ExitSelectKeepThenCycleNext => {
             app.shell.exit_select_keep_then_cycle(true);
         }
         KeyAction::ExitSelectKeepThenCyclePrev => {
             app.shell.exit_select_keep_then_cycle(false);
         }
-        KeyAction::ToggleCollapse => app.shell.toggle_collapse(),
+        KeyAction::ToggleCollapse => app.toggle_focused_collapse(),
         KeyAction::EnterSelect => {
             app.enter_select_mode();
             app.sync_selection_overlay();
@@ -127,16 +134,7 @@ fn apply_key_action(
         KeyAction::ConfirmDebugRun => app.confirm_debug_run(),
         KeyAction::OpenEmptyForm => app.edit_region_open_empty(),
         KeyAction::EditFocusedRegion => app.edit_region_start(),
-        KeyAction::ClearSelection => {
-            app.abandon_edit_form();
-            app.status_banner = None;
-            app.pending_overlap_action = None;
-            app.seq_selection.clear();
-            if app.shell.mode == InteractionMode::Select {
-                app.shell.enter_idle();
-            }
-            app.sync_selection_overlay();
-        }
+        KeyAction::ClearSelection => app.clear_editspec_selection(),
         KeyAction::CloseOverlay => app.close_run_overlay(),
         KeyAction::CloseContextMenu => {
             app.close_context_menu();
@@ -147,16 +145,33 @@ fn apply_key_action(
         KeyAction::ContextMenuApply => app.apply_context_menu(),
         KeyAction::CloseHelp => app.close_help_overlay(),
         KeyAction::ToggleHelp => app.toggle_help_overlay(),
-        KeyAction::RotateX(d) => app.camera.rotate_x(d),
-        KeyAction::RotateY(d) => app.camera.rotate_y(d),
-        KeyAction::RotateZ(d) => app.camera.rotate_z(d),
-        KeyAction::Pan(x, y) => app.camera.pan(x, y),
-        KeyAction::ZoomIn => app.camera.zoom_in(),
-        KeyAction::ZoomOut => app.camera.zoom_out(),
+        KeyAction::RotateX(d) => {
+            app.camera.rotate_x(d);
+            app.emit_view_camera();
+        }
+        KeyAction::RotateY(d) => {
+            app.camera.rotate_y(d);
+            app.emit_view_camera();
+        }
+        KeyAction::RotateZ(d) => {
+            app.camera.rotate_z(d);
+            app.emit_view_camera();
+        }
+        KeyAction::Pan(x, y) => {
+            app.camera.pan(x, y);
+            app.emit_view_camera();
+        }
+        KeyAction::ZoomIn => {
+            app.camera.zoom_in();
+            app.emit_view_camera();
+        }
+        KeyAction::ZoomOut => {
+            app.camera.zoom_out();
+            app.emit_view_camera();
+        }
         KeyAction::ResetCamera => {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            app.camera.reset();
-            app.recalculate_zoom(cols, rows);
+            app.reset_view_camera(cols, rows);
         }
         KeyAction::CycleColor => app.cycle_color(),
         KeyAction::CycleViz => app.cycle_viz_mode(),
@@ -197,7 +212,23 @@ fn apply_key_action(
         }
         KeyAction::RegionSplit => app.edit_region_split(),
         KeyAction::Undo => app.edit_undo(),
-        KeyAction::Redo => app.edit_redo(),
+        KeyAction::Redo => app.session_redo(),
+        KeyAction::ToggleConsole => app.toggle_console(),
+        KeyAction::CloseConsole => app.close_console_focus(),
+        KeyAction::ConsoleCycleNext => {
+            app.close_console_focus();
+            app.shell.cycle_focus_next();
+            app.emit_session_focus();
+        }
+        KeyAction::ConsoleCyclePrev => {
+            app.close_console_focus();
+            app.shell.cycle_focus_prev();
+            app.emit_session_focus();
+        }
+        KeyAction::ConsoleScroll(delta) => app.scroll_console(delta),
+        KeyAction::ToggleConsoleVerbose => app.toggle_console_verbose(),
+        KeyAction::SessionUndo => app.session_undo(),
+        KeyAction::SessionRedo => app.session_redo(),
         KeyAction::SeqCursor(delta) => {
             let residues = app.current_residues().to_vec();
             if !residues.is_empty() {
@@ -206,6 +237,7 @@ fn apply_key_action(
                 app.ensure_seq_visible(cursor);
                 app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
+                app.emit_editspec_cursor();
             }
         }
         KeyAction::SeqExpandStart(delta) => {
@@ -227,10 +259,12 @@ fn apply_key_action(
         KeyAction::SeqSelectSegment => {
             let residues = app.current_residues().to_vec();
             if !residues.is_empty() {
+                app.prepare_editspec_undo();
                 let cursor = app.seq_selection.cursor;
                 app.seq_selection.select_segment(&residues, cursor);
                 app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
+                app.finish_editspec_select("select segment");
             }
         }
         KeyAction::SeqJumpSegment(dir) => {
@@ -405,6 +439,14 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            if app.shell.console_focused {
+                if me.kind == MouseEventKind::ScrollUp {
+                    app.scroll_console(-1);
+                } else {
+                    app.scroll_console(1);
+                }
+                return;
+            }
             match ui::chrome::pane_at(&chrome_rects(app), me.column, me.row) {
                 Some(PaneId::View) => {
                     if me.kind == MouseEventKind::ScrollUp {
@@ -1030,11 +1072,13 @@ fn main() -> Result<()> {
 
         let draw_start = Instant::now();
         terminal.draw(|frame| {
+            let console_h = if app.console_open { 6 } else { 0 };
             let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1),
                     Constraint::Min(8),
+                    Constraint::Length(console_h),
                     Constraint::Length(2),
                     Constraint::Length(1),
                 ])
@@ -1069,8 +1113,11 @@ fn main() -> Result<()> {
                 );
             }
 
-            ui::statusbar::render_statusbar(frame, outer[2], &app);
-            ui::helpbar::render_helpbar(frame, outer[3], &app);
+            if app.console_open {
+                ui::console::render_console(frame, outer[2], &app);
+            }
+            ui::statusbar::render_statusbar(frame, outer[3], &app);
+            ui::helpbar::render_helpbar(frame, outer[4], &app);
 
             match app.shell.overlay {
                 Overlay::RunComposer | Overlay::RunStatus => {

@@ -11,6 +11,9 @@ use crate::workflow::{WorkflowError, WorkflowStatus};
 use crate::edit_history::{
     EditHistory, HistoryEntry, ValidationIssue, validate_regions,
 };
+use crate::events::{
+    EventLevel, EventLog, EventPane, empty_payload, run_op_from_console_event,
+};
 use crate::shell::{self, InteractionMode, Overlay, PaneId, Shell, parse_compact_regions, parse_direct_range};
 use crate::model::interface::{InterfaceAnalysis, analyze_binding_pockets, analyze_interface};
 use crate::model::protein::Protein;
@@ -734,6 +737,40 @@ pub struct App {
     pub state_file: Option<String>,
     pub state_mtime: Option<std::time::SystemTime>,
     pub console_open: bool,
+    pub console_verbose: bool,
+    pub console_scroll: u16,
+    pub event_log: EventLog,
+    console_run_seen: usize,
+    undo_stack: Vec<RevertSnapshot>,
+    redo_stack: Vec<RevertSnapshot>,
+    editspec_undo_hold: Option<RevertSnapshot>,
+}
+
+#[derive(Clone)]
+enum RevertSnapshot {
+    Workflow {
+        graph: Option<serde_json::Value>,
+        status: Option<WorkflowStatus>,
+        cursor: usize,
+    },
+    Load {
+        path: Option<String>,
+    },
+    EditSpec {
+        regions: Vec<EditSpecRegion>,
+        focused: usize,
+        scroll: u16,
+        selection: SeqSelection,
+    },
+    View {
+        scheme_type: ColorSchemeType,
+        saved_scheme_type: ColorSchemeType,
+        viz_mode: VizMode,
+        current_chain: usize,
+        camera: Camera,
+        render_mode: RenderMode,
+        selection: SeqSelection,
+    },
 }
 
 impl App {
@@ -850,15 +887,21 @@ impl App {
 
         // Initialize the Python bridge.  Failure is non-fatal: PV degrades to
         // read-only mode and the header shows a "Read-only" indicator.
-        let (bridge, python_available) = match GemlibBridge::new() {
-            Ok(b) => {
-                eprintln!("Python bridge: initialized (gemlib + contiger available)");
-                (Some(b), true)
-            }
-            Err(e) => {
-                eprintln!("Warning: Python bridge unavailable — running in read-only mode.");
-                eprintln!("  Reason: {}", e);
-                (None, false)
+        // Unit tests never embed Python: GEMLIB PYTHONPATH plus pyo3 init
+        // can abort the process before assertions run.
+        let (bridge, python_available) = if cfg!(test) {
+            (None, false)
+        } else {
+            match GemlibBridge::new() {
+                Ok(b) => {
+                    eprintln!("Python bridge: initialized (gemlib + contiger available)");
+                    (Some(b), true)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Python bridge unavailable — running in read-only mode.");
+                    eprintln!("  Reason: {}", e);
+                    (None, false)
+                }
             }
         };
 
@@ -933,6 +976,13 @@ impl App {
             state_file: None,
             state_mtime: None,
             console_open: false,
+            console_verbose: false,
+            console_scroll: 0,
+            event_log: EventLog::default(),
+            console_run_seen: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            editspec_undo_hold: None,
         }
     }
 
@@ -1027,6 +1077,362 @@ impl App {
             self.status_banner = Some(hint);
             self.console_open = true;
         }
+        self.project_run_events(&text);
+    }
+
+    fn project_run_events(&mut self, text: &str) {
+        let rows = crate::debug_run::parse_console_records(text);
+        if rows.len() <= self.console_run_seen {
+            return;
+        }
+        for row in rows.iter().skip(self.console_run_seen) {
+            let op = run_op_from_console_event(&row.event);
+            self.event_log.emit(
+                EventLevel::Run,
+                EventPane::None,
+                op,
+                false,
+                row.message.clone(),
+                serde_json::json!({
+                    "event": row.event,
+                    "stage": row.stage,
+                }),
+            );
+        }
+        self.console_run_seen = rows.len();
+        self.scroll_console_to_end();
+    }
+
+    fn emit(
+        &mut self,
+        level: EventLevel,
+        pane: EventPane,
+        op: &str,
+        undoable: bool,
+        summary: impl Into<String>,
+        revert: Option<RevertSnapshot>,
+    ) {
+        self.event_log.emit(level, pane, op, undoable, summary, empty_payload());
+        if undoable {
+            if let Some(snapshot) = revert {
+                self.undo_stack.push(snapshot);
+                self.redo_stack.clear();
+            }
+        }
+        if let Some(summary) = self.event_log.newest_visible_summary(self.console_verbose) {
+            self.status_banner = Some(summary);
+        }
+        self.scroll_console_to_end();
+    }
+
+    fn snapshot_workflow(&self) -> RevertSnapshot {
+        RevertSnapshot::Workflow {
+            graph: self.workflow_graph.clone(),
+            status: self.workflow_status.clone(),
+            cursor: self.workflow_cursor,
+        }
+    }
+
+    fn snapshot_load(&self) -> RevertSnapshot {
+        RevertSnapshot::Load {
+            path: self.loaded_structure_path.clone(),
+        }
+    }
+
+    fn snapshot_editspec(&self) -> RevertSnapshot {
+        RevertSnapshot::EditSpec {
+            regions: self.snapshot_regions(),
+            focused: self.focused_region,
+            scroll: self.panel_scroll,
+            selection: self.seq_selection.clone(),
+        }
+    }
+
+    fn snapshot_view(&self) -> RevertSnapshot {
+        RevertSnapshot::View {
+            scheme_type: self.color_scheme.scheme_type,
+            saved_scheme_type: self.saved_color_scheme_type,
+            viz_mode: self.viz_mode,
+            current_chain: self.current_chain,
+            camera: self.camera.clone(),
+            render_mode: self.render_mode,
+            selection: self.seq_selection.clone(),
+        }
+    }
+
+    fn apply_revert(&mut self, snapshot: RevertSnapshot) {
+        match snapshot {
+            RevertSnapshot::Workflow {
+                graph,
+                status,
+                cursor,
+            } => {
+                self.workflow_graph = graph;
+                self.workflow_status = status;
+                self.workflow_cursor = cursor;
+                let _ = self.persist_workflow_draft();
+            }
+            RevertSnapshot::Load { path } => {
+                self.loaded_structure_path = path.clone();
+                if let Some(path) = path {
+                    if let Ok(protein) = crate::parser::pdb::load_structure(&path) {
+                        self.replace_protein(protein);
+                    }
+                }
+            }
+            RevertSnapshot::EditSpec {
+                regions,
+                focused,
+                scroll,
+                selection,
+            } => {
+                if self.annotation.is_none() {
+                    self.annotation = Some(Annotation {
+                        editspec_regions: Some(Vec::new()),
+                        iteration: None,
+                        highlights: None,
+                    });
+                }
+                if let Some(ref mut ann) = self.annotation {
+                    ann.editspec_regions = Some(regions);
+                }
+                self.focused_region = focused;
+                self.panel_scroll = scroll;
+                self.seq_selection = selection;
+                self.revalidate();
+                self.sync_selection_overlay();
+            }
+            RevertSnapshot::View {
+                scheme_type,
+                saved_scheme_type,
+                viz_mode,
+                current_chain,
+                camera,
+                render_mode,
+                selection,
+            } => {
+                self.saved_color_scheme_type = saved_scheme_type;
+                self.viz_mode = viz_mode;
+                self.current_chain = current_chain;
+                self.camera = camera;
+                self.render_mode = render_mode;
+                self.seq_selection = selection;
+                if scheme_type == ColorSchemeType::Interface
+                    || self.active_panel == ActivePanel::Interface
+                {
+                    self.rebuild_interface_colors();
+                } else {
+                    self.color_scheme =
+                        ColorScheme::new(scheme_type, self.protein.residue_count());
+                    self.mesh_dirty = true;
+                }
+                self.sync_selection_overlay();
+            }
+        }
+    }
+
+    pub fn toggle_console(&mut self) {
+        if self.shell.console_focused {
+            self.close_console_focus();
+            return;
+        }
+        self.console_open = true;
+        self.shell.console_focused = true;
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.overlay_open",
+            false,
+            "console focused",
+            None,
+        );
+    }
+
+    pub fn close_console_focus(&mut self) {
+        self.shell.console_focused = false;
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.overlay_close",
+            false,
+            "console unfocused",
+            None,
+        );
+    }
+
+    pub fn scroll_console(&mut self, delta: i32) {
+        let visible = self.event_log.visible(self.console_verbose).len();
+        let height = 4usize;
+        let max = visible.saturating_sub(height) as u16;
+        if delta < 0 {
+            self.console_scroll = self.console_scroll.saturating_sub(delta.unsigned_abs() as u16);
+        } else {
+            self.console_scroll = self
+                .console_scroll
+                .saturating_add(delta as u16)
+                .min(max);
+        }
+    }
+
+    fn scroll_console_to_end(&mut self) {
+        let visible = self.event_log.visible(self.console_verbose).len();
+        self.console_scroll = visible.saturating_sub(4) as u16;
+    }
+
+    pub fn toggle_console_verbose(&mut self) {
+        self.console_verbose = !self.console_verbose;
+        self.scroll_console_to_end();
+    }
+
+    pub fn session_undo(&mut self) {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            return;
+        };
+        let current = match &snapshot {
+            RevertSnapshot::Workflow { .. } => self.snapshot_workflow(),
+            RevertSnapshot::Load { .. } => self.snapshot_load(),
+            RevertSnapshot::EditSpec { .. } => self.snapshot_editspec(),
+            RevertSnapshot::View { .. } => self.snapshot_view(),
+        };
+        self.apply_revert(snapshot);
+        self.redo_stack.push(current);
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.undo",
+            false,
+            "undo TUI",
+            None,
+        );
+    }
+
+    pub fn prepare_editspec_undo(&mut self) {
+        self.editspec_undo_hold = Some(self.snapshot_editspec());
+    }
+
+    pub fn finish_editspec_select(&mut self, summary: &str) {
+        let revert = self.editspec_undo_hold.take();
+        self.emit(
+            EventLevel::Intent,
+            EventPane::EditSpec,
+            "editspec.select",
+            true,
+            summary.to_string(),
+            revert,
+        );
+    }
+
+    pub fn emit_session_focus(&mut self) {
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.focus",
+            false,
+            format!("focus {}", self.shell.focused.name()),
+            None,
+        );
+    }
+
+    pub fn toggle_focused_collapse(&mut self) {
+        self.shell.toggle_collapse();
+        let pane = self.shell.focused.name();
+        let state = if self.shell.is_expanded(self.shell.focused) {
+            "expand"
+        } else {
+            "collapse"
+        };
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.collapse",
+            false,
+            format!("{state} {pane}"),
+            None,
+        );
+    }
+
+    pub fn emit_view_camera(&mut self) {
+        self.emit(
+            EventLevel::Nav,
+            EventPane::View,
+            "view.camera",
+            false,
+            "camera",
+            None,
+        );
+    }
+
+    pub fn reset_view_camera(&mut self, cols: u16, rows: u16) {
+        let revert = self.snapshot_view();
+        self.camera.reset();
+        self.recalculate_zoom(cols, rows);
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.reset_camera",
+            true,
+            "reset camera",
+            Some(revert),
+        );
+    }
+
+    pub fn clear_editspec_selection(&mut self) {
+        let revert = if self.seq_selection.active {
+            Some(self.snapshot_editspec())
+        } else {
+            None
+        };
+        self.abandon_edit_form();
+        self.status_banner = None;
+        self.pending_overlap_action = None;
+        self.seq_selection.clear();
+        if self.shell.mode == InteractionMode::Select {
+            self.shell.enter_idle();
+        }
+        self.sync_selection_overlay();
+        if revert.is_some() {
+            self.emit(
+                EventLevel::Intent,
+                EventPane::EditSpec,
+                "editspec.clear_select",
+                true,
+                "clear select",
+                revert,
+            );
+        }
+    }
+
+    pub fn emit_editspec_cursor(&mut self) {
+        self.emit(
+            EventLevel::Nav,
+            EventPane::EditSpec,
+            "editspec.cursor",
+            false,
+            format!("seq {}", self.seq_selection.cursor),
+            None,
+        );
+    }
+
+    pub fn session_redo(&mut self) {
+        let Some(snapshot) = self.redo_stack.pop() else {
+            return;
+        };
+        let current = match &snapshot {
+            RevertSnapshot::Workflow { .. } => self.snapshot_workflow(),
+            RevertSnapshot::Load { .. } => self.snapshot_load(),
+            RevertSnapshot::EditSpec { .. } => self.snapshot_editspec(),
+            RevertSnapshot::View { .. } => self.snapshot_view(),
+        };
+        self.apply_revert(snapshot);
+        self.undo_stack.push(current);
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.redo",
+            false,
+            "redo TUI",
+            None,
+        );
     }
 
     pub fn confirm_debug_run(&mut self) {
@@ -1034,7 +1440,14 @@ impl App {
         match self.spawn_debug_run() {
             Ok(()) => {
                 self.console_open = true;
-                self.status_banner = Some("waiting debug … (3s)".to_string());
+                self.emit(
+                    EventLevel::Run,
+                    EventPane::None,
+                    "run.debug_start",
+                    false,
+                    "waiting debug … (3s)",
+                    None,
+                );
             }
             Err(err) => {
                 self.status_banner = Some(err);
@@ -1077,6 +1490,14 @@ impl App {
         self.tree_cursor = next.clamp(0, count as isize - 1) as usize;
         self.focus_workflow_from_tree();
         self.ensure_tree_visible();
+        self.emit(
+            EventLevel::Nav,
+            EventPane::Tree,
+            "tree.cursor",
+            false,
+            format!("tree cursor {}", self.tree_cursor),
+            None,
+        );
     }
 
     pub fn tree_set_expanded(&mut self, expanded: bool) {
@@ -1089,6 +1510,14 @@ impl App {
             self.product_tree.set_expanded(&sample_id, expanded);
             self.reindex_tree_cursor(&sample_id);
             self.ensure_tree_visible();
+            self.emit(
+                EventLevel::Nav,
+                EventPane::Tree,
+                "tree.fold",
+                false,
+                format!("fold {sample_id}"),
+                None,
+            );
         }
     }
 
@@ -1123,6 +1552,14 @@ impl App {
                 self.product_tree.set_expanded(&sample_id, !expanded);
                 self.reindex_tree_cursor(&sample_id);
                 self.ensure_tree_visible();
+                self.emit(
+                    EventLevel::Nav,
+                    EventPane::Tree,
+                    "tree.fold",
+                    false,
+                    format!("fold {sample_id}"),
+                    None,
+                );
             }
             crate::ui::tree_pane::TreeHit::Label => {
                 self.tree_cursor = idx;
@@ -1204,14 +1641,24 @@ impl App {
             return Ok(false);
         };
         let path = resolve_structure_path(self.campaign_root.as_deref(), &relative);
+        let revert = self.snapshot_load();
         let protein = crate::parser::pdb::load_structure(path.to_str().unwrap_or_default())
             .map_err(|err| err.to_string())?;
         self.replace_protein(protein);
         self.loaded_structure_path = Some(path.display().to_string());
+        self.emit(
+            EventLevel::Intent,
+            EventPane::Tree,
+            "tree.load",
+            true,
+            format!("load {}", relative),
+            Some(revert),
+        );
         Ok(true)
     }
 
     pub fn cycle_color(&mut self) {
+        let revert = self.snapshot_view();
         if self.active_panel == ActivePanel::Interface {
             // While interface mode is active, cycle the saved scheme so the
             // user's preference is tracked, but keep displaying Interface colors.
@@ -1221,6 +1668,14 @@ impl App {
             self.color_scheme = ColorScheme::new(next, self.protein.residue_count());
             self.mesh_dirty = true;
         }
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.style",
+            true,
+            "cycle color",
+            Some(revert),
+        );
     }
 
     /// Poll the background interface analysis thread (non-blocking).
@@ -1255,7 +1710,16 @@ impl App {
     }
 
     pub fn cycle_viz_mode(&mut self) {
+        let revert = self.snapshot_view();
         self.viz_mode = self.viz_mode.next();
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.style",
+            true,
+            format!("viz {}", self.viz_mode.name()),
+            Some(revert),
+        );
     }
 
     fn rebuild_interface_colors(&mut self) {
@@ -1455,6 +1919,7 @@ impl App {
 
     pub fn next_chain(&mut self) {
         if !self.protein.chains.is_empty() {
+            let revert = self.snapshot_view();
             self.current_chain = (self.current_chain + 1) % self.protein.chains.len();
             if self.seq_selection.active {
                 self.seq_selection.clear();
@@ -1463,11 +1928,13 @@ impl App {
             if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
+            self.emit_view_chain(Some(revert));
         }
     }
 
     pub fn prev_chain(&mut self) {
         if !self.protein.chains.is_empty() {
+            let revert = self.snapshot_view();
             self.current_chain = if self.current_chain == 0 {
                 self.protein.chains.len() - 1
             } else {
@@ -1480,7 +1947,25 @@ impl App {
             if self.active_panel == ActivePanel::Interface {
                 self.rebuild_interface_colors();
             }
+            self.emit_view_chain(Some(revert));
         }
+    }
+
+    fn emit_view_chain(&mut self, revert: Option<RevertSnapshot>) {
+        let name = self
+            .protein
+            .chains
+            .get(self.current_chain)
+            .map(|chain| chain.id.as_str())
+            .unwrap_or("—");
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.chain",
+            revert.is_some(),
+            format!("chain {name}"),
+            revert,
+        );
     }
 
     pub fn chain_names(&self) -> Vec<String> {
@@ -1545,6 +2030,7 @@ impl App {
     /// From FullHD, steps down to HalfBlock (next lower tier).
     /// Bound to `m`.
     pub fn toggle_hd(&mut self, term_cols: u16, term_rows: u16) {
+        let revert = self.snapshot_view();
         self.render_mode = match self.render_mode {
             RenderMode::Braille => RenderMode::HalfBlock,
             RenderMode::HalfBlock => RenderMode::Braille,
@@ -1555,11 +2041,20 @@ impl App {
         self.ssh_hd_warning_frames = 0;
         self.needs_clear = true;
         self.recalculate_zoom(term_cols, term_rows);
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.style",
+            true,
+            format!("hd {}", self.render_mode.name()),
+            Some(revert),
+        );
     }
 
     /// Upgrade to FullHD (Sixel/Kitty) or back to HalfBlock.
     /// Bound to `M` (Shift+M).  Warns when entering FullHD over SSH.
     pub fn toggle_fullhd(&mut self, term_cols: u16, term_rows: u16) {
+        let revert = self.snapshot_view();
         self.render_mode = match self.render_mode {
             RenderMode::FullHD => RenderMode::HalfBlock,
             _ => RenderMode::FullHD,
@@ -1577,6 +2072,14 @@ impl App {
         }
 
         self.recalculate_zoom(term_cols, term_rows);
+        self.emit(
+            EventLevel::Intent,
+            EventPane::View,
+            "view.style",
+            true,
+            format!("hd {}", self.render_mode.name()),
+            Some(revert),
+        );
     }
 
     // -- Region editing methods -----------------------------------------------
@@ -1592,12 +2095,21 @@ impl App {
 
     /// Push the current state onto the undo history before an edit operation.
     fn push_history(&mut self, description: &str) {
+        let revert = self.snapshot_editspec();
         self.edit_history.push(HistoryEntry {
             description: description.to_string(),
             snapshot: self.snapshot_regions(),
             focused_region: self.focused_region,
             panel_scroll: self.panel_scroll,
         });
+        self.emit(
+            EventLevel::Intent,
+            EventPane::EditSpec,
+            "editspec.action",
+            true,
+            description.to_string(),
+            Some(revert),
+        );
     }
 
     /// Re-run validation on the current region list and cache the results.
@@ -1613,6 +2125,10 @@ impl App {
     /// Undo the last edit operation.  Restores the region list, focus, and scroll
     /// from the history snapshot.
     pub fn edit_undo(&mut self) {
+        if !self.undo_stack.is_empty() {
+            self.session_undo();
+            return;
+        }
         if let Some(entry) = self.edit_history.undo() {
             if self.annotation.is_none() {
                 self.annotation = Some(Annotation {
@@ -2319,6 +2835,14 @@ impl App {
         self.abandon_edit_form();
         self.shell.focus(PaneId::EditSpec);
         self.shell.enter_mode(InteractionMode::Select);
+        self.emit(
+            EventLevel::Intent,
+            EventPane::EditSpec,
+            "editspec.enter_select",
+            false,
+            "enter select",
+            None,
+        );
     }
 
     pub fn abandon_edit_form(&mut self) {
@@ -2800,6 +3324,14 @@ impl App {
         let next = self.workflow_cursor as isize + delta;
         self.workflow_cursor = next.clamp(0, count as isize - 1) as usize;
         self.workflow_delete_confirm = false;
+        self.emit(
+            EventLevel::Nav,
+            EventPane::Workflow,
+            "workflow.cursor",
+            false,
+            format!("wf cursor {}", self.workflow_cursor),
+            None,
+        );
     }
 
     pub fn focused_workflow_node(&self) -> Option<&crate::workflow::WorkflowNode> {
@@ -2864,10 +3396,28 @@ impl App {
         if dragged == drop {
             return;
         }
+        self.apply_workflow_rewire_drop(dragged, drop);
+    }
+
+    pub(crate) fn apply_workflow_rewire_drop(&mut self, dragged: usize, drop: usize) {
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[])
+            .to_vec();
         let Some(rewire) = crate::workflow::classify_workflow_rewire(&nodes, dragged, drop) else {
-            self.status_banner = Some("端口对不上，没改边".to_string());
+            self.emit(
+                EventLevel::Intent,
+                EventPane::Workflow,
+                "workflow.draft_error",
+                false,
+                "端口对不上，没改边",
+                None,
+            );
             return;
         };
+        let revert = self.snapshot_workflow();
         self.ensure_workflow_graph();
         if let (Some(graph), Some(status)) = (
             self.workflow_graph.as_mut(),
@@ -2880,8 +3430,22 @@ impl App {
         }
         self.workflow_cursor = dragged;
         match self.persist_workflow_draft() {
-            Ok(()) => self.status_banner = Some("已改 from · 草稿，未钉进 run.yaml".to_string()),
-            Err(err) => self.status_banner = Some(format!("已改 from · 未落盘: {err}")),
+            Ok(()) => self.emit(
+                EventLevel::Intent,
+                EventPane::Workflow,
+                "workflow.rewire",
+                true,
+                "已改 from · 草稿，未钉进 run.yaml",
+                Some(revert),
+            ),
+            Err(err) => self.emit(
+                EventLevel::Intent,
+                EventPane::Workflow,
+                "workflow.rewire",
+                true,
+                format!("已改 from · 未落盘: {err}"),
+                Some(revert),
+            ),
         }
     }
 
@@ -2936,10 +3500,19 @@ impl App {
             return Ok(());
         };
         let path = resolve_structure_path(self.campaign_root.as_deref(), &relative);
+        let revert = self.snapshot_load();
         let protein = crate::parser::pdb::load_structure(path.to_str().unwrap_or_default())
             .map_err(|err| err.to_string())?;
         self.replace_protein(protein);
         self.loaded_structure_path = Some(path.display().to_string());
+        self.emit(
+            EventLevel::Intent,
+            EventPane::Workflow,
+            "workflow.load",
+            true,
+            format!("load {}", relative),
+            Some(revert),
+        );
         Ok(())
     }
 
@@ -3005,7 +3578,16 @@ impl App {
             return;
         };
         self.close_block_palette();
+        let revert = self.snapshot_workflow();
         self.add_workflow_block(&block);
+        self.emit(
+            EventLevel::Intent,
+            EventPane::Workflow,
+            "workflow.add",
+            true,
+            format!("add {block}"),
+            Some(revert),
+        );
     }
 
     pub fn request_workflow_delete(&mut self) {
@@ -3048,6 +3630,7 @@ impl App {
     }
 
     fn apply_workflow_delete(&mut self) {
+        let revert = self.snapshot_workflow();
         self.ensure_workflow_graph();
         let Some(kind) = self.workflow_delete_allowed() else {
             return;
@@ -3066,8 +3649,22 @@ impl App {
             }
         }
         match self.persist_workflow_draft() {
-            Ok(()) => self.status_banner = Some("已删 · 草稿，未钉进 run.yaml".to_string()),
-            Err(err) => self.status_banner = Some(format!("已删 · 未落盘: {err}")),
+            Ok(()) => self.emit(
+                EventLevel::Intent,
+                EventPane::Workflow,
+                "workflow.delete",
+                true,
+                "已删 · 草稿，未钉进 run.yaml",
+                Some(revert),
+            ),
+            Err(err) => self.emit(
+                EventLevel::Intent,
+                EventPane::Workflow,
+                "workflow.delete",
+                true,
+                format!("已删 · 未落盘: {err}"),
+                Some(revert),
+            ),
         }
     }
 
@@ -3367,19 +3964,63 @@ impl App {
             return;
         }
         self.shell.open_overlay(Overlay::RunComposer);
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            "session.overlay_open",
+            false,
+            "composer",
+            None,
+        );
     }
 
     pub fn toggle_help_overlay(&mut self) {
         match self.shell.overlay {
-            Overlay::None => self.shell.open_overlay(Overlay::Help),
-            Overlay::Help => self.shell.close_overlay(),
+            Overlay::None => {
+                self.shell.open_overlay(Overlay::Help);
+                self.emit(
+                    EventLevel::Session,
+                    EventPane::None,
+                    "session.overlay_open",
+                    false,
+                    "help",
+                    None,
+                );
+            }
+            Overlay::Help => {
+                self.shell.close_overlay();
+                self.emit(
+                    EventLevel::Session,
+                    EventPane::None,
+                    "session.overlay_close",
+                    false,
+                    "help",
+                    None,
+                );
+            }
             Overlay::ContextMenu => {
                 self.close_context_menu();
                 self.shell.open_overlay(Overlay::Help);
+                self.emit(
+                    EventLevel::Session,
+                    EventPane::None,
+                    "session.overlay_open",
+                    false,
+                    "help",
+                    None,
+                );
             }
             Overlay::BlockPalette => {
                 self.close_block_palette();
                 self.shell.open_overlay(Overlay::Help);
+                self.emit(
+                    EventLevel::Session,
+                    EventPane::None,
+                    "session.overlay_open",
+                    false,
+                    "help",
+                    None,
+                );
             }
             Overlay::RunComposer | Overlay::RunStatus => {}
         }
@@ -3388,12 +4029,28 @@ impl App {
     pub fn close_help_overlay(&mut self) {
         if self.shell.overlay == Overlay::Help {
             self.shell.close_overlay();
+            self.emit(
+                EventLevel::Session,
+                EventPane::None,
+                "session.overlay_close",
+                false,
+                "help",
+                None,
+            );
         }
     }
 
     pub fn close_run_overlay(&mut self) {
         if matches!(self.shell.overlay, Overlay::RunComposer | Overlay::RunStatus) {
             self.shell.close_overlay();
+            self.emit(
+                EventLevel::Session,
+                EventPane::None,
+                "session.overlay_close",
+                false,
+                "composer",
+                None,
+            );
         }
     }
 
@@ -3408,6 +4065,9 @@ impl App {
             }
             if dy != 0 {
                 self.camera.rotate_x(dy as f64);
+            }
+            if dx != 0 || dy != 0 {
+                self.emit_view_camera();
             }
         }
         self.view_drag_last = Some((col, row));
@@ -3577,5 +4237,164 @@ mod tests {
         assert_eq!(sel.range(), Some((5, 7)));
         sel.jump_segment(&residues, -1);
         assert_eq!(sel.range(), Some((0, 4)));
+    }
+
+    fn test_app() -> App {
+        use crate::model::protein::{Chain, MoleculeType};
+        let protein = Protein {
+            name: "t".to_string(),
+            chains: vec![Chain {
+                id: "A".to_string(),
+                residues: helix_sheet_residues(),
+                molecule_type: MoleculeType::Protein,
+            }],
+            ligands: Vec::new(),
+        };
+        App::new(
+            protein,
+            AppConfig {
+                render_mode: RenderMode::HalfBlock,
+                viz_mode: VizMode::Backbone,
+                user_explicit_mode: true,
+                color_override: None,
+            },
+            80,
+            24,
+            ratatui_image::picker::Picker::halfblocks(),
+        )
+    }
+
+    fn seed_rewire_app(root: &std::path::Path) -> App {
+        let mut app = test_app();
+        app.campaign_root = Some(root.display().to_string());
+        let mut loop_node = crate::workflow::loop_draft_node("optimize", 2);
+        loop_node.inputs = vec!["seed".to_string()];
+        app.workflow_status = Some(WorkflowStatus {
+            nodes: vec![
+                crate::workflow::compose_draft_node("seed", "import"),
+                crate::workflow::compose_draft_node("extra", "import"),
+                loop_node,
+                crate::workflow::step_draft_node("optimize", "mpnn"),
+            ],
+            can_run: true,
+            edit_spec: String::new(),
+            draft: false,
+        });
+        app.workflow_graph = Some(serde_json::json!({
+            "compose": [
+                {"id": "seed", "block": "import", "inputs": []},
+                {"id": "extra", "block": "import", "inputs": []}
+            ],
+            "loop": {
+                "id": "optimize",
+                "inputs": ["seed"],
+                "rounds": 2,
+                "steps": ["mpnn"]
+            }
+        }));
+        app
+    }
+
+    #[test]
+    fn undo_tui_rewire_restores_graph_not_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "pv-undo-tui-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("outputs/attempt")).unwrap();
+        let attempt = root.join("outputs/attempt/keep.txt");
+        std::fs::write(&attempt, "untouched").unwrap();
+        std::fs::write(
+            root.join("console.jsonl"),
+            "{\"event\":\"waiting\",\"stage\":\"fold\",\"message\":\"waiting fold … (3s)\"}\n",
+        )
+        .unwrap();
+
+        let mut app = seed_rewire_app(&root);
+        app.poll_console_hint();
+        let waiting = app
+            .event_log
+            .events()
+            .iter()
+            .find(|event| event.op == "run.waiting")
+            .expect("waiting projected");
+        assert!(!waiting.undoable);
+        assert_eq!(waiting.level, EventLevel::Run);
+
+        app.apply_workflow_rewire_drop(2, 1);
+        assert_eq!(
+            app.workflow_graph.as_ref().unwrap()["loop"]["inputs"][0],
+            "extra"
+        );
+        assert!(
+            app.event_log
+                .events()
+                .iter()
+                .any(|event| event.op == "workflow.rewire" && event.undoable)
+        );
+
+        app.session_undo();
+        assert_eq!(
+            app.workflow_graph.as_ref().unwrap()["loop"]["inputs"][0],
+            "seed"
+        );
+        assert_eq!(std::fs::read_to_string(&attempt).unwrap(), "untouched");
+        assert!(
+            app.event_log
+                .events()
+                .iter()
+                .any(|event| event.op == "run.waiting" && !event.undoable)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undo_tui_style_restores_color_before_rewire() {
+        let root = std::env::temp_dir().join(format!(
+            "pv-undo-style-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = seed_rewire_app(&root);
+        let before = app.color_scheme.scheme_type;
+        app.apply_workflow_rewire_drop(2, 1);
+        app.cycle_color();
+        assert_ne!(app.color_scheme.scheme_type, before);
+        assert_eq!(
+            app.workflow_graph.as_ref().unwrap()["loop"]["inputs"][0],
+            "extra"
+        );
+        app.session_undo();
+        assert_eq!(app.color_scheme.scheme_type, before);
+        assert_eq!(
+            app.workflow_graph.as_ref().unwrap()["loop"]["inputs"][0],
+            "extra"
+        );
+        app.session_undo();
+        assert_eq!(
+            app.workflow_graph.as_ref().unwrap()["loop"]["inputs"][0],
+            "seed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_visible_levels_hide_view_camera() {
+        let mut app = test_app();
+        app.emit_session_focus();
+        app.emit_view_camera();
+        app.cycle_color();
+        let hidden = app.event_log.visible(false);
+        assert!(hidden.iter().any(|event| event.op == "session.focus"));
+        assert!(hidden.iter().any(|event| event.op == "view.style"));
+        assert!(hidden.iter().all(|event| event.op != "view.camera"));
+        let shown = app.event_log.visible(true);
+        assert!(shown.iter().any(|event| event.op == "view.camera"));
     }
 }

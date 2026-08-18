@@ -9,6 +9,19 @@ use crate::shell::{InteractionMode, Overlay};
 
 /// Render the keybinding hints bar at the bottom.
 pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
+    if app.shell.console_focused {
+        frame.render_widget(
+            Paragraph::new(Line::from(hint_line(&[
+                ("j/k", "scroll"),
+                ("v", "verbose"),
+                ("u", "undo"),
+                ("Esc/c", "back"),
+                ("Tab", "pane"),
+            ]))),
+            area,
+        );
+        return;
+    }
     if let Some(banner) = &app.status_banner {
         let spans = vec![
             Span::styled(

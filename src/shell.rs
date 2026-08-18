@@ -158,6 +158,14 @@ pub enum KeyAction {
     BlockPaletteNext,
     BlockPaletteApply,
     CloseBlockPalette,
+    ToggleConsole,
+    CloseConsole,
+    ConsoleCycleNext,
+    ConsoleCyclePrev,
+    ConsoleScroll(i32),
+    ToggleConsoleVerbose,
+    SessionUndo,
+    SessionRedo,
     Ignore,
 }
 
@@ -174,6 +182,7 @@ pub struct Shell {
     pub editspec_w: u16,
     pub tree_h: u16,
     pub editspec_h: u16,
+    pub console_focused: bool,
 }
 
 impl Default for Shell {
@@ -196,6 +205,7 @@ impl Shell {
             editspec_w: 48,
             tree_h: 8,
             editspec_h: 14,
+            console_focused: false,
         }
     }
 
@@ -212,6 +222,7 @@ impl Shell {
             editspec_w: 48,
             tree_h: 8,
             editspec_h: 14,
+            console_focused: false,
         }
     }
 
@@ -348,6 +359,8 @@ pub const KEY_TABLE: &[(&str, &str)] = &[
     ("Select: Tab", "Idle (keep selection) then cycle pane"),
     ("EditRegion: form keys", "Type range (A51-80 / A:51-80 / 51-80); Tab is a field; Esc cancels"),
     ("Run Composer: Esc", "Close overlay; Ctrl+R does not stack"),
+    ("c", "Open and focus Console chrome (not a fifth pane). C cycles View colors"),
+    ("Console: j/k v u Esc", "Scroll / verbose (show nav) / undo TUI / return to last pane"),
 ];
 
 /// Single key router. Priority: overlay → EditRegion → Select → pane Idle → chrome.
@@ -366,10 +379,28 @@ pub fn route_key(shell: &Shell, key: KeyEvent, has_selection: bool, can_run: boo
         Overlay::None => {}
     }
 
+    if shell.console_focused {
+        return route_console(key);
+    }
+
     match shell.mode {
         InteractionMode::EditRegion => route_edit_region(key, ctrl),
         InteractionMode::Select => route_select(key, ctrl, can_run),
         InteractionMode::Idle => route_idle(shell, key, ctrl, has_selection, can_run),
+    }
+}
+
+fn route_console(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('c') => KeyAction::CloseConsole,
+        KeyCode::Tab => KeyAction::ConsoleCycleNext,
+        KeyCode::BackTab => KeyAction::ConsoleCyclePrev,
+        KeyCode::Char('j') | KeyCode::Down => KeyAction::ConsoleScroll(1),
+        KeyCode::Char('k') | KeyCode::Up => KeyAction::ConsoleScroll(-1),
+        KeyCode::Char('v') => KeyAction::ToggleConsoleVerbose,
+        KeyCode::Char('u') => KeyAction::SessionUndo,
+        KeyCode::Char('U') => KeyAction::SessionRedo,
+        _ => KeyAction::Ignore,
     }
 }
 
@@ -545,7 +576,8 @@ fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can
         KeyCode::Char('+') | KeyCode::Char('=') if shell.view_focused() => KeyAction::ZoomIn,
         KeyCode::Char('-') if shell.view_focused() => KeyAction::ZoomOut,
         KeyCode::Char('r') if shell.view_focused() => KeyAction::ResetCamera,
-        KeyCode::Char('c') => KeyAction::CycleColor,
+        KeyCode::Char('c') => KeyAction::ToggleConsole,
+        KeyCode::Char('C') => KeyAction::CycleColor,
         KeyCode::Char('v') => KeyAction::CycleViz,
         KeyCode::Char('m') => KeyAction::ToggleHd,
         KeyCode::Char('M') => KeyAction::ToggleFullHd,
@@ -932,6 +964,35 @@ mod tests {
         assert_eq!(parsed[0], ("A".to_string(), 1, 50, "keep".to_string()));
         assert_eq!(parsed[1], ("A".to_string(), 51, 80, "edit".to_string()));
         assert_eq!(compact_edit_spec(&parsed), "A1-50=,A51-80~");
+    }
+
+    #[test]
+    fn tab_still_cycles_four_panes_when_console_closed() {
+        let view = Shell::pdb_session();
+        assert_eq!(route(&view, key(KeyCode::Char('c'))), KeyAction::ToggleConsole);
+        assert_eq!(route(&view, key(KeyCode::Char('C'))), KeyAction::CycleColor);
+        assert_eq!(route(&view, key(KeyCode::Tab)), KeyAction::CyclePaneNext);
+    }
+
+    #[test]
+    fn console_focus_owns_jk_and_not_workflow() {
+        let mut shell = Shell::campaign_session();
+        shell.focus(PaneId::Workflow);
+        shell.console_focused = true;
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::ConsoleScroll(1));
+        assert_eq!(route(&shell, key(KeyCode::Char('v'))), KeyAction::ToggleConsoleVerbose);
+        assert_eq!(route(&shell, key(KeyCode::Char('u'))), KeyAction::SessionUndo);
+        assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::CloseConsole);
+        assert_eq!(route(&shell, key(KeyCode::Tab)), KeyAction::ConsoleCycleNext);
+    }
+
+    #[test]
+    fn composer_still_wins_over_console() {
+        let mut shell = Shell::pdb_session();
+        shell.console_focused = true;
+        shell.open_overlay(Overlay::RunComposer);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::ConfirmDebugRun);
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::RunIgnore);
     }
 
     #[test]

@@ -24,6 +24,46 @@ pub fn debug_run_argv(gemlib_bin: &str, recipe: &str, campaign: &str) -> Vec<Str
     ]
 }
 
+pub struct ConsoleRecord {
+    pub event: String,
+    pub stage: String,
+    pub message: String,
+}
+
+pub fn parse_console_records(text: &str) -> Vec<ConsoleRecord> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let event = value
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let stage = value
+            .get("stage")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{event} {stage}").trim().to_string());
+        rows.push(ConsoleRecord {
+            event,
+            stage,
+            message,
+        });
+    }
+    rows
+}
+
 pub fn last_console_hint(text: &str) -> Option<String> {
     let mut hint = None;
     for line in text.lines() {
@@ -62,6 +102,18 @@ mod tests {
                 "--debug"
             ]
         );
+    }
+
+    #[test]
+    fn parse_console_records_keeps_waiting_and_placed() {
+        let text = concat!(
+            "{\"event\":\"waiting\",\"stage\":\"fold\",\"message\":\"waiting fold … (3s)\"}\n",
+            "{\"event\":\"placed\",\"stage\":\"fold\",\"message\":\"placed fold\"}\n",
+        );
+        let rows = parse_console_records(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event, "waiting");
+        assert_eq!(rows[1].event, "placed");
     }
 
     #[test]
