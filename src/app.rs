@@ -6,6 +6,8 @@ use ratatui_image::picker::Picker;
 
 use crate::bridge::GemlibBridge;
 use crate::product_tree::{ProductTree, StudioSeed, resolve_structure_path};
+use crate::ui::block_palette::BlockPalette;
+use crate::workflow::{WorkflowError, WorkflowStatus};
 use crate::edit_history::{
     EditHistory, HistoryEntry, ValidationIssue, validate_regions,
 };
@@ -394,6 +396,7 @@ pub struct SeqChainBlock {
 pub enum ContextTarget {
     Selection,
     Region(usize),
+    Workflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +407,8 @@ pub enum ContextItem {
     EditRange,
     Delete,
     ReplaceOverlap,
+    WorkflowAdd,
+    WorkflowDelete,
 }
 
 impl ContextItem {
@@ -419,6 +424,8 @@ impl ContextItem {
             Self::EditRange => " Edit range".to_string(),
             Self::Delete => " Delete region".to_string(),
             Self::ReplaceOverlap => " Replace overlapping".to_string(),
+            Self::WorkflowAdd => " 加一块".to_string(),
+            Self::WorkflowDelete => " 删除".to_string(),
         }
     }
 }
@@ -715,6 +722,13 @@ pub struct App {
     pub product_tree: ProductTree,
     pub tree_cursor: usize,
     pub tree_scroll: u16,
+    pub workflow_status: Option<WorkflowStatus>,
+    pub workflow_error: Option<WorkflowError>,
+    pub workflow_graph: Option<serde_json::Value>,
+    pub workflow_cursor: usize,
+    pub workflow_delete_confirm: bool,
+    pub workflow_drag: Option<usize>,
+    pub block_palette: Option<BlockPalette>,
     pub campaign_root: Option<String>,
     pub loaded_structure_path: Option<String>,
 }
@@ -904,6 +918,13 @@ impl App {
             product_tree: ProductTree::default(),
             tree_cursor: 0,
             tree_scroll: 0,
+            workflow_status: None,
+            workflow_error: None,
+            workflow_graph: None,
+            workflow_cursor: 0,
+            workflow_delete_confirm: false,
+            workflow_drag: None,
+            block_palette: None,
             campaign_root: None,
             loaded_structure_path: None,
         }
@@ -914,8 +935,13 @@ impl App {
             .campaign_root
             .or_else(|| seed.product_tree.campaign_root.clone());
         self.product_tree = seed.product_tree;
+        self.workflow_status = seed.workflow_status;
+        self.workflow_error = seed.workflow_error;
+        self.workflow_graph = seed.workflow_graph;
         self.tree_cursor = 0;
         self.tree_scroll = 0;
+        self.workflow_cursor = 0;
+        self.workflow_delete_confirm = false;
         if !self.product_tree.is_empty() {
             self.shell = Shell::campaign_session();
         }
@@ -933,6 +959,7 @@ impl App {
         }
         let next = self.tree_cursor as isize + delta;
         self.tree_cursor = next.clamp(0, count as isize - 1) as usize;
+        self.focus_workflow_from_tree();
         self.ensure_tree_visible();
     }
 
@@ -1056,6 +1083,7 @@ impl App {
             return Ok(false);
         };
         self.product_tree.select(&sample_id);
+        self.focus_workflow_from_tree();
         let Some(relative) = structure_path else {
             return Ok(false);
         };
@@ -2390,7 +2418,7 @@ impl App {
         self.shell.focus(PaneId::EditSpec);
         if matches!(
             self.shell.overlay,
-            Overlay::Help | Overlay::RunComposer | Overlay::RunStatus
+            Overlay::Help | Overlay::RunComposer | Overlay::RunStatus | Overlay::BlockPalette
         ) {
             return;
         }
@@ -2411,6 +2439,23 @@ impl App {
     }
 
     fn build_context_items(&self, target: ContextTarget) -> Vec<ContextItem> {
+        if matches!(target, ContextTarget::Workflow) {
+            let mut items = vec![
+                ContextItem::Header("图"),
+                ContextItem::WorkflowAdd,
+            ];
+            if matches!(
+                self.workflow_delete_allowed(),
+                Some(
+                    crate::workflow::WorkflowDeleteKind::Compose
+                        | crate::workflow::WorkflowDeleteKind::Rfd
+                        | crate::workflow::WorkflowDeleteKind::WholeLoop
+                )
+            ) {
+                items.push(ContextItem::WorkflowDelete);
+            }
+            return items;
+        }
         let mut items = vec![ContextItem::Header("Action")];
         for action in VALID_ACTIONS {
             items.push(ContextItem::Action(action));
@@ -2432,6 +2477,7 @@ impl App {
                     items.push(ContextItem::ReplaceOverlap);
                 }
             }
+            ContextTarget::Workflow => {}
         }
         items
     }
@@ -2476,6 +2522,7 @@ impl App {
         match item {
             ContextItem::Header(_) => {}
             ContextItem::Action(name) => match target {
+                ContextTarget::Workflow => {}
                 ContextTarget::Selection => {
                     self.pending_overlap_action = Some(name.to_string());
                     if let Some(msg) = self.apply_action_shortcut(name) {
@@ -2486,10 +2533,12 @@ impl App {
                 ContextTarget::Region(idx) => self.set_region_action(idx, name),
             },
             ContextItem::Label(name) => match target {
+                ContextTarget::Workflow => {}
                 ContextTarget::Selection => self.apply_label_to_selection(name),
                 ContextTarget::Region(idx) => self.set_region_label(idx, name),
             },
             ContextItem::EditRange => match target {
+                ContextTarget::Workflow => {}
                 ContextTarget::Region(idx) => {
                     self.focused_region = idx;
                     self.edit_region_start();
@@ -2503,6 +2552,12 @@ impl App {
                     self.focused_region = idx;
                     self.delete_focused_region_now();
                 }
+            }
+            ContextItem::WorkflowAdd => {
+                self.open_block_palette();
+            }
+            ContextItem::WorkflowDelete => {
+                self.request_workflow_delete();
             }
             ContextItem::ReplaceOverlap => {
                 if let Some((chain, start, end)) = self.selection_seq_range() {
@@ -2608,7 +2663,587 @@ impl App {
     }
 
     pub fn can_run(&self) -> bool {
-        self.python_available
+        let table_ok = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.can_run)
+            .unwrap_or(true);
+        self.python_available && table_ok
+    }
+
+    pub fn workflow_move(&mut self, delta: isize) {
+        let count = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.len())
+            .unwrap_or(0);
+        if count == 0 {
+            self.workflow_cursor = 0;
+            return;
+        }
+        let next = self.workflow_cursor as isize + delta;
+        self.workflow_cursor = next.clamp(0, count as isize - 1) as usize;
+        self.workflow_delete_confirm = false;
+    }
+
+    pub fn focused_workflow_node(&self) -> Option<&crate::workflow::WorkflowNode> {
+        self.workflow_status
+            .as_ref()
+            .and_then(|status| status.node(self.workflow_cursor))
+    }
+
+    pub fn handle_workflow_click(&mut self, col: u16, row: u16) -> Result<(), String> {
+        let Some(rect) = self.last_workflow_rect else {
+            self.workflow_drag = None;
+            return Ok(());
+        };
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[]);
+        let Some(idx) = crate::ui::workflow_pane::hit_test(rect, col, row, nodes) else {
+            self.workflow_drag = None;
+            return Ok(());
+        };
+        self.workflow_cursor = idx;
+        self.workflow_drag = Some(idx);
+        self.workflow_delete_confirm = false;
+        self.activate_workflow_node()
+    }
+
+    pub fn handle_workflow_drag(&mut self, col: u16, row: u16) {
+        if self.workflow_drag.is_none() {
+            return;
+        }
+        let Some(rect) = self.last_workflow_rect else {
+            return;
+        };
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[]);
+        if let Some(idx) = crate::ui::workflow_pane::hit_test(rect, col, row, nodes) {
+            self.workflow_cursor = idx;
+        }
+    }
+
+    pub fn handle_workflow_drop(&mut self, col: u16, row: u16) {
+        let Some(dragged) = self.workflow_drag.take() else {
+            return;
+        };
+        let Some(rect) = self.last_workflow_rect else {
+            return;
+        };
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[])
+            .to_vec();
+        let Some(drop) = crate::ui::workflow_pane::hit_test(rect, col, row, &nodes) else {
+            return;
+        };
+        if dragged == drop {
+            return;
+        }
+        let Some(rewire) = crate::workflow::classify_workflow_rewire(&nodes, dragged, drop) else {
+            self.status_banner = Some("端口对不上，没改边".to_string());
+            return;
+        };
+        self.ensure_workflow_graph();
+        if let (Some(graph), Some(status)) = (
+            self.workflow_graph.as_mut(),
+            self.workflow_status.as_mut(),
+        ) {
+            crate::workflow::apply_workflow_rewire(graph, &mut status.nodes, &rewire);
+            status.draft = true;
+        } else {
+            return;
+        }
+        self.workflow_cursor = dragged;
+        match self.persist_workflow_draft() {
+            Ok(()) => self.status_banner = Some("已改 from · 草稿，未钉进 run.yaml".to_string()),
+            Err(err) => self.status_banner = Some(format!("已改 from · 未落盘: {err}")),
+        }
+    }
+
+    pub fn handle_workflow_right_click(&mut self, col: u16, row: u16) {
+        self.shell.focus(PaneId::Workflow);
+        let Some(rect) = self.last_workflow_rect else {
+            self.open_block_palette();
+            return;
+        };
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[]);
+        if let Some(idx) = crate::ui::workflow_pane::hit_test(rect, col, row, nodes) {
+            self.workflow_cursor = idx;
+            self.workflow_delete_confirm = false;
+            self.open_workflow_context_menu(col, row);
+            return;
+        }
+        self.open_block_palette();
+    }
+
+    fn open_workflow_context_menu(&mut self, col: u16, row: u16) {
+        if matches!(
+            self.shell.overlay,
+            Overlay::Help | Overlay::RunComposer | Overlay::RunStatus | Overlay::BlockPalette
+        ) {
+            return;
+        }
+        if self.shell.overlay == Overlay::ContextMenu {
+            self.shell.close_overlay();
+        }
+        let items = self.build_context_items(ContextTarget::Workflow);
+        let cursor = items.iter().position(|item| item.selectable()).unwrap_or(0);
+        self.context_menu = Some(ContextMenu {
+            col,
+            row,
+            cursor,
+            items,
+            target: ContextTarget::Workflow,
+            last_rect: Rect::default(),
+        });
+        self.shell.open_overlay(Overlay::ContextMenu);
+    }
+
+    pub fn activate_workflow_node(&mut self) -> Result<(), String> {
+        let Some(node) = self.focused_workflow_node() else {
+            return Ok(());
+        };
+        let Some(relative) = node.structure_path.clone() else {
+            return Ok(());
+        };
+        let path = resolve_structure_path(self.campaign_root.as_deref(), &relative);
+        let protein = crate::parser::pdb::load_structure(path.to_str().unwrap_or_default())
+            .map_err(|err| err.to_string())?;
+        self.replace_protein(protein);
+        self.loaded_structure_path = Some(path.display().to_string());
+        Ok(())
+    }
+
+    fn focus_workflow_from_tree(&mut self) {
+        let Some((kind, condition)) = self
+            .product_tree
+            .visible_rows()
+            .get(self.tree_cursor)
+            .map(|(_depth, node)| (node.kind.clone(), node.condition_node().map(str::to_string)))
+        else {
+            return;
+        };
+        let Some(status) = self.workflow_status.as_ref() else {
+            return;
+        };
+        if let Some(idx) = crate::workflow::workflow_index_for_tree_row(
+            &status.nodes,
+            &kind,
+            condition.as_deref(),
+        ) {
+            self.workflow_cursor = idx;
+        }
+    }
+
+    pub fn open_block_palette(&mut self) {
+        if matches!(
+            self.shell.overlay,
+            Overlay::Help | Overlay::RunComposer | Overlay::RunStatus | Overlay::ContextMenu
+        ) {
+            return;
+        }
+        let nodes = self
+            .workflow_status
+            .as_ref()
+            .map(|status| status.nodes.as_slice())
+            .unwrap_or(&[]);
+        self.workflow_delete_confirm = false;
+        self.block_palette = Some(BlockPalette::from_nodes(nodes));
+        self.shell.open_overlay(Overlay::BlockPalette);
+    }
+
+    pub fn close_block_palette(&mut self) {
+        self.block_palette = None;
+        if self.shell.overlay == Overlay::BlockPalette {
+            self.shell.close_overlay();
+        }
+    }
+
+    pub fn block_palette_move(&mut self, delta: isize) {
+        if let Some(palette) = self.block_palette.as_mut() {
+            palette.move_cursor(delta);
+        }
+    }
+
+    pub fn apply_block_palette(&mut self) {
+        let Some(block) = self
+            .block_palette
+            .as_ref()
+            .and_then(|palette| palette.selected_block())
+            .map(str::to_string)
+        else {
+            self.close_block_palette();
+            return;
+        };
+        self.close_block_palette();
+        self.add_workflow_block(&block);
+    }
+
+    pub fn request_workflow_delete(&mut self) {
+        match self.workflow_delete_allowed() {
+            None => {
+                self.workflow_delete_confirm = false;
+                self.status_banner = Some("这个盒不能删".to_string());
+            }
+            Some(crate::workflow::WorkflowDeleteKind::ForbiddenRequiredStep) => {
+                self.workflow_delete_confirm = false;
+                self.status_banner = Some("mpnn/fold/evaluate 不能单拆，要拆就拆整圈".to_string());
+            }
+            Some(crate::workflow::WorkflowDeleteKind::ForbiddenLoopSeed) => {
+                self.workflow_delete_confirm = false;
+                self.status_banner = Some("loop 还在，不能删 from 种".to_string());
+            }
+            Some(_) if !self.workflow_delete_confirm => {
+                self.workflow_delete_confirm = true;
+                let name = self
+                    .focused_workflow_node()
+                    .map(|node| node.id.clone())
+                    .unwrap_or_else(|| "节点".to_string());
+                self.status_banner = Some(format!("再按 d 确认删除 {name}"));
+            }
+            Some(_) => {
+                self.workflow_delete_confirm = false;
+                self.apply_workflow_delete();
+            }
+        }
+    }
+
+    fn workflow_delete_allowed(&self) -> Option<crate::workflow::WorkflowDeleteKind> {
+        let status = self.workflow_status.as_ref()?;
+        let from = crate::workflow::loop_from_id(self.workflow_graph.as_ref());
+        crate::workflow::classify_workflow_delete(
+            &status.nodes,
+            self.workflow_cursor,
+            from.as_deref(),
+        )
+    }
+
+    fn apply_workflow_delete(&mut self) {
+        self.ensure_workflow_graph();
+        let Some(kind) = self.workflow_delete_allowed() else {
+            return;
+        };
+        match kind {
+            crate::workflow::WorkflowDeleteKind::WholeLoop => self.delete_whole_loop(),
+            crate::workflow::WorkflowDeleteKind::Rfd => self.delete_rfd_step(),
+            crate::workflow::WorkflowDeleteKind::Compose => self.delete_compose_node(),
+            crate::workflow::WorkflowDeleteKind::ForbiddenRequiredStep
+            | crate::workflow::WorkflowDeleteKind::ForbiddenLoopSeed => {}
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            status.draft = true;
+            if self.workflow_cursor >= status.nodes.len() {
+                self.workflow_cursor = status.nodes.len().saturating_sub(1);
+            }
+        }
+        match self.persist_workflow_draft() {
+            Ok(()) => self.status_banner = Some("已删 · 草稿，未钉进 run.yaml".to_string()),
+            Err(err) => self.status_banner = Some(format!("已删 · 未落盘: {err}")),
+        }
+    }
+
+    fn add_workflow_block(&mut self, block: &str) {
+        self.ensure_workflow_graph();
+        if block == "loop" {
+            self.add_loop();
+        } else if block == "rfd" {
+            self.add_rfd_step();
+        } else {
+            self.add_compose_block(block);
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            status.draft = true;
+            status.can_run = false;
+        }
+        match self.persist_workflow_draft() {
+            Ok(()) => {
+                self.status_banner = Some(format!("已加 {block} · 草稿，未钉进 run.yaml"));
+            }
+            Err(err) => {
+                self.status_banner = Some(format!("已加 {block} · 未落盘: {err}"));
+            }
+        }
+    }
+
+    fn ensure_workflow_graph(&mut self) {
+        if self.workflow_graph.is_some() {
+            return;
+        }
+        let Some(status) = self.workflow_status.as_ref() else {
+            return;
+        };
+        let compose: Vec<serde_json::Value> = status
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "compose")
+            .map(|node| {
+                serde_json::json!({
+                    "id": node.id,
+                    "block": node.block,
+                    "inputs": node.inputs,
+                    "params": {},
+                })
+            })
+            .collect();
+        let loop_node = status.nodes.iter().find(|node| node.kind == "loop");
+        let steps: Vec<String> = status
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "step")
+            .map(|node| node.block.clone())
+            .collect();
+        let mut graph = serde_json::json!({ "compose": compose, "loop": null });
+        if let Some(loop_node) = loop_node {
+            let from = if loop_node.inputs.is_empty() {
+                compose
+                    .first()
+                    .and_then(|node| node.get("id").cloned())
+                    .map(|id| serde_json::json!([id]))
+                    .unwrap_or_else(|| serde_json::json!([]))
+            } else {
+                serde_json::json!(loop_node.inputs)
+            };
+            graph["loop"] = serde_json::json!({
+                "id": loop_node.id,
+                "inputs": from,
+                "rounds": loop_node.rounds.max(1),
+                "steps": steps,
+                "passthrough_rfd": !steps.iter().any(|step| step == "rfd"),
+                "edit_spec": status.edit_spec,
+                "gate": {"mode": "human"},
+            });
+        }
+        self.workflow_graph = Some(graph);
+    }
+
+    fn next_compose_id(&self, block: &str) -> String {
+        let used: Vec<String> = self
+            .workflow_status
+            .as_ref()
+            .map(|status| {
+                status
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == "compose")
+                    .map(|node| node.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !used.iter().any(|id| id == block) {
+            return block.to_string();
+        }
+        for index in 2..99 {
+            let candidate = format!("{block}-{index}");
+            if !used.iter().any(|id| id == &candidate) {
+                return candidate;
+            }
+        }
+        format!("{block}-x")
+    }
+
+    fn add_compose_block(&mut self, block: &str) {
+        let id = self.next_compose_id(block);
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            if let Some(compose) = graph.get_mut("compose").and_then(|value| value.as_array_mut()) {
+                compose.push(serde_json::json!({
+                    "id": id,
+                    "block": block,
+                    "inputs": [],
+                    "params": {},
+                }));
+            }
+        }
+        let insert_at = self
+            .workflow_status
+            .as_ref()
+            .and_then(|status| status.nodes.iter().position(|node| node.kind != "compose"))
+            .unwrap_or_else(|| {
+                self.workflow_status
+                    .as_ref()
+                    .map(|status| status.nodes.len())
+                    .unwrap_or(0)
+            });
+        if let Some(status) = self.workflow_status.as_mut() {
+            status
+                .nodes
+                .insert(insert_at, crate::workflow::compose_draft_node(&id, block));
+            self.workflow_cursor = insert_at;
+        }
+    }
+
+    fn add_loop(&mut self) {
+        if self
+            .workflow_status
+            .as_ref()
+            .is_some_and(|status| status.nodes.iter().any(|node| node.kind == "loop"))
+        {
+            self.status_banner = Some("已经有一颗 loop".to_string());
+            return;
+        }
+        let from = self.workflow_status.as_ref().and_then(|status| {
+            status
+                .nodes
+                .iter()
+                .find(|node| node.kind == "compose")
+                .map(|node| node.id.clone())
+        });
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            graph["loop"] = serde_json::json!({
+                "id": "optimize",
+                "inputs": from.as_ref().map(|id| vec![id.clone()]).unwrap_or_default(),
+                "rounds": 1,
+                "steps": ["mpnn", "fold", "evaluate"],
+                "passthrough_rfd": true,
+                "edit_spec": "",
+                "gate": {"mode": "human"},
+            });
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            let insert_at = status.nodes.len();
+            let mut loop_node = crate::workflow::loop_draft_node("optimize", 1);
+            if let Some(from) = from.as_ref() {
+                loop_node.inputs = vec![from.clone()];
+            }
+            status.nodes.push(loop_node);
+            status.nodes.push(crate::workflow::step_draft_node("optimize", "mpnn"));
+            status.nodes.push(crate::workflow::step_draft_node("optimize", "fold"));
+            status.nodes.push(crate::workflow::step_draft_node("optimize", "evaluate"));
+            status.nodes.push(crate::workflow::gate_draft_node("optimize"));
+            self.workflow_cursor = insert_at;
+        }
+    }
+
+    fn delete_whole_loop(&mut self) {
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            graph["loop"] = serde_json::Value::Null;
+            if graph.get("optimize").is_some() {
+                graph["optimize"] = serde_json::Value::Null;
+            }
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            status.nodes.retain(|node| {
+                node.kind != "loop" && node.kind != "step" && node.kind != "gate"
+            });
+        }
+    }
+
+    fn delete_rfd_step(&mut self) {
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            for key in ["loop", "optimize"] {
+                if let Some(steps) = graph
+                    .get_mut(key)
+                    .and_then(|value| value.get_mut("steps"))
+                    .and_then(|value| value.as_array_mut())
+                {
+                    steps.retain(|step| step.as_str() != Some("rfd"));
+                    graph[key]["passthrough_rfd"] = serde_json::json!(true);
+                }
+            }
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            status
+                .nodes
+                .retain(|node| !(node.kind == "step" && node.block == "rfd"));
+        }
+    }
+
+    fn delete_compose_node(&mut self) {
+        let Some(id) = self.focused_workflow_node().map(|node| node.id.clone()) else {
+            return;
+        };
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            if let Some(compose) = graph.get_mut("compose").and_then(|value| value.as_array_mut()) {
+                compose.retain(|node| node.get("id").and_then(|value| value.as_str()) != Some(id.as_str()));
+            }
+        }
+        if let (Some(graph), Some(status)) = (
+            self.workflow_graph.as_mut(),
+            self.workflow_status.as_mut(),
+        ) {
+            crate::workflow::detach_compose_source(graph, &mut status.nodes, &id);
+        } else if let Some(status) = self.workflow_status.as_mut() {
+            for node in status.nodes.iter_mut() {
+                if node.kind == "compose" {
+                    node.inputs.retain(|item| item != &id);
+                }
+            }
+        }
+        if let Some(status) = self.workflow_status.as_mut() {
+            status.nodes.retain(|node| node.id != id);
+        }
+    }
+
+    fn add_rfd_step(&mut self) {
+        if let Some(graph) = self.workflow_graph.as_mut() {
+            for key in ["loop", "optimize"] {
+                if let Some(steps) = graph
+                    .get_mut(key)
+                    .and_then(|value| value.get_mut("steps"))
+                    .and_then(|value| value.as_array_mut())
+                {
+                    if !steps.iter().any(|step| step.as_str() == Some("rfd")) {
+                        steps.insert(0, serde_json::json!("rfd"));
+                    }
+                    graph[key]["passthrough_rfd"] = serde_json::json!(false);
+                }
+            }
+        }
+        let loop_id = self
+            .workflow_status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == "loop")
+                    .map(|node| node.id.clone())
+            })
+            .unwrap_or_else(|| "optimize".to_string());
+        let insert_at = self
+            .workflow_status
+            .as_ref()
+            .and_then(|status| status.nodes.iter().position(|node| node.kind == "step"))
+            .unwrap_or_else(|| {
+                self.workflow_status
+                    .as_ref()
+                    .map(|status| status.nodes.len())
+                    .unwrap_or(0)
+            });
+        if let Some(status) = self.workflow_status.as_mut() {
+            if status
+                .nodes
+                .iter()
+                .any(|node| node.kind == "step" && node.block == "rfd")
+            {
+                return;
+            }
+            status
+                .nodes
+                .insert(insert_at, crate::workflow::rfd_draft_node(&loop_id));
+            self.workflow_cursor = insert_at;
+        }
+    }
+
+    fn persist_workflow_draft(&self) -> Result<(), String> {
+        let root = self.campaign_root.as_deref().ok_or("no campaign")?;
+        let graph = self.workflow_graph.as_ref().ok_or("no graph")?;
+        let recipe = crate::workflow::recipe_from_graph_dump(graph);
+        let path = std::path::Path::new(root).join("workflow_draft.json");
+        let text = serde_json::to_string_pretty(&recipe).map_err(|err| err.to_string())?;
+        std::fs::write(path, text).map_err(|err| err.to_string())
     }
 
     pub fn enter_run_mode(&mut self) {
@@ -2624,6 +3259,10 @@ impl App {
             Overlay::Help => self.shell.close_overlay(),
             Overlay::ContextMenu => {
                 self.close_context_menu();
+                self.shell.open_overlay(Overlay::Help);
+            }
+            Overlay::BlockPalette => {
+                self.close_block_palette();
                 self.shell.open_overlay(Overlay::Help);
             }
             Overlay::RunComposer | Overlay::RunStatus => {}

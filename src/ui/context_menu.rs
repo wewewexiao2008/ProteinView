@@ -57,7 +57,8 @@ pub fn render_context_menu(frame: &mut Frame, area: Rect, menu: &mut ContextMenu
             ContextItem::EditRange | ContextItem::ReplaceOverlap => {
                 Style::default().fg(Color::Green)
             }
-            ContextItem::Delete => Style::default().fg(Color::Red),
+            ContextItem::Delete | ContextItem::WorkflowDelete => Style::default().fg(Color::Red),
+            ContextItem::WorkflowAdd => Style::default().fg(Color::Yellow),
         };
         lines.push(Line::from(Span::styled(item.caption(), style)));
     }
@@ -67,7 +68,10 @@ pub fn render_context_menu(frame: &mut Frame, area: Rect, menu: &mut ContextMenu
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" Action / Label "),
+                .title(match menu.target {
+                    crate::app::ContextTarget::Workflow => " Workflow ",
+                    _ => " Action / Label ",
+                }),
         ),
         popup,
     );

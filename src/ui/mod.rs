@@ -1,3 +1,4 @@
+pub mod block_palette;
 pub mod chrome;
 pub mod context_menu;
 pub mod editspec_panel;

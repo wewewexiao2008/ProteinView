@@ -31,7 +31,7 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
         Overlay::RunComposer | Overlay::RunStatus => {
             hint_line(&[("Esc", "close Run"), ("Ctrl+R", "ignored")])
         }
-        Overlay::ContextMenu => hint_line(&[
+        Overlay::ContextMenu | Overlay::BlockPalette => hint_line(&[
             ("j/k", "item"),
             ("Enter", "apply"),
             ("Esc", "close"),
@@ -51,6 +51,15 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
                 ("1-5", "action"),
                 ("right", "menu"),
                 ("Esc", "clear"),
+                ("Tab", "pane"),
+            ]),
+            InteractionMode::Idle if app.shell.workflow_focused() => hint_line(&[
+                ("j/k", "node"),
+                ("Enter", "load"),
+                ("a", "add"),
+                ("d", "del"),
+                ("drag", "from"),
+                ("right", "menu"),
                 ("Tab", "pane"),
             ]),
             InteractionMode::Idle if app.shell.tree_focused() => hint_line(&[

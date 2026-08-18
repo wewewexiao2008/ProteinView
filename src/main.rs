@@ -7,6 +7,7 @@ mod parser;
 mod product_tree;
 mod render;
 mod shell;
+mod workflow;
 mod ui;
 
 use anyhow::Result;
@@ -311,6 +312,19 @@ fn apply_key_action(
                 log!(logfile, "tree activate failed: {err}");
             }
         }
+        KeyAction::WorkflowNext => app.workflow_move(1),
+        KeyAction::WorkflowPrev => app.workflow_move(-1),
+        KeyAction::OpenBlockPalette => app.open_block_palette(),
+        KeyAction::WorkflowDelete => app.request_workflow_delete(),
+        KeyAction::BlockPalettePrev => app.block_palette_move(-1),
+        KeyAction::BlockPaletteNext => app.block_palette_move(1),
+        KeyAction::BlockPaletteApply => app.apply_block_palette(),
+        KeyAction::CloseBlockPalette => app.close_block_palette(),
+        KeyAction::WorkflowActivate => {
+            if let Err(err) = app.activate_workflow_node() {
+                log!(logfile, "workflow activate failed: {err}");
+            }
+        }
         KeyAction::RunIgnore | KeyAction::Ignore => {}
     }
 }
@@ -337,6 +351,21 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
     );
     match me.kind {
         MouseEventKind::Down(MouseButton::Left)
+            if app.shell.overlay == Overlay::BlockPalette =>
+        {
+            if let Some(palette) = app.block_palette.as_ref() {
+                if let Some(idx) = ui::block_palette::hit_test_item(palette, me.column, me.row) {
+                    if let Some(palette) = app.block_palette.as_mut() {
+                        palette.cursor = idx;
+                    }
+                    app.apply_block_palette();
+                    return;
+                }
+            }
+            app.close_block_palette();
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Left)
             if app.shell.overlay == Overlay::ContextMenu =>
         {
             if let Some(menu) = app.context_menu.as_ref() {
@@ -354,18 +383,23 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
         MouseEventKind::Down(MouseButton::Right) => {
             if matches!(
                 app.shell.overlay,
-                Overlay::Help | Overlay::RunComposer | Overlay::RunStatus
+                Overlay::Help | Overlay::RunComposer | Overlay::RunStatus | Overlay::BlockPalette
             ) {
                 return;
             }
             if app.shell.overlay == Overlay::ContextMenu {
                 app.close_context_menu();
             }
-            if ui::chrome::pane_at(&chrome_rects(app), me.column, me.row) == Some(PaneId::EditSpec)
-            {
-                if let Some(sidebar_rect) = app.last_sidebar_rect {
-                    handle_sidebar_right_click(app, me.row, me.column, sidebar_rect, logfile);
+            match ui::chrome::pane_at(&chrome_rects(app), me.column, me.row) {
+                Some(PaneId::EditSpec) => {
+                    if let Some(sidebar_rect) = app.last_sidebar_rect {
+                        handle_sidebar_right_click(app, me.row, me.column, sidebar_rect, logfile);
+                    }
                 }
+                Some(PaneId::Workflow) => {
+                    app.handle_workflow_right_click(me.column, me.row);
+                }
+                _ => {}
             }
         }
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -404,6 +438,7 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
             }
             app.view_drag_last = None;
             app.chrome_drag = None;
+            app.workflow_drag = None;
             let rects = chrome_rects(app);
             if let Some(pane) = ui::chrome::fold_pane_at(&rects, me.column, me.row) {
                 app.pointer_focus_pane(pane);
@@ -432,7 +467,11 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
                         app.seq_selection.dragging = false;
                         app.view_drag_last = Some((me.column, me.row));
                     }
-                    PaneId::Workflow => {}
+                    PaneId::Workflow => {
+                        if let Err(err) = app.handle_workflow_click(me.column, me.row) {
+                            log!(logfile, "workflow click failed: {err}");
+                        }
+                    }
                 }
             }
         }
@@ -471,11 +510,18 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
                 }
                 return;
             }
+            if app.workflow_drag.is_some() {
+                app.handle_workflow_drag(me.column, me.row);
+                return;
+            }
             if app.view_drag_last.is_some() {
                 app.apply_view_drag(me.column, me.row);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if app.workflow_drag.is_some() {
+                app.handle_workflow_drop(me.column, me.row);
+            }
             app.seq_selection.dragging = false;
             app.view_drag_last = None;
             app.chrome_drag = None;
@@ -1029,6 +1075,11 @@ fn main() -> Result<()> {
                 Overlay::ContextMenu => {
                     if let Some(menu) = app.context_menu.as_mut() {
                         ui::context_menu::render_context_menu(frame, frame.area(), menu);
+                    }
+                }
+                Overlay::BlockPalette => {
+                    if let Some(palette) = app.block_palette.as_mut() {
+                        ui::block_palette::render_block_palette(frame, frame.area(), palette);
                     }
                 }
                 Overlay::None => {}

@@ -597,6 +597,13 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(chain_spans));
     }
 
+    if let Some(node) = app.focused_workflow_node() {
+        lines.push(Line::from(Span::styled(
+            format!(" wf {}  {}", node.block, node.editspec_note),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
     lines.push(Line::from(""));
 
     // ========================================================================
