@@ -1,8 +1,8 @@
 //! Studio four-pane chrome and exclusive-focus key router.
 //!
 //! ProteinView is the 3D engine; this module is the Studio session chrome:
-//! Overlay (Help | RunComposer | RunStatus) → EditSpec Select/EditRegion →
-//! focused-pane Idle → session chrome. Workflow stays an empty shell.
+//! Overlay (Help | RunComposer | RunStatus | ContextMenu | BlockPalette) →
+//! EditSpec Select/EditRegion → focused-pane Idle → session chrome.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -43,7 +43,7 @@ impl PaneId {
     }
 }
 
-/// Session overlay. Depth is 0 or 1; Help, Composer, and ContextMenu never stack.
+/// Session overlay. Depth is 0 or 1; Help, Composer, ContextMenu, and BlockPalette never stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -52,6 +52,7 @@ pub enum Overlay {
     #[allow(dead_code)]
     RunStatus,
     ContextMenu,
+    BlockPalette,
 }
 
 impl Overlay {
@@ -88,6 +89,7 @@ pub enum KeyAction {
     ToggleCollapse,
     EnterSelect,
     EnterRun,
+    ConfirmDebugRun,
     OpenEmptyForm,
     EditFocusedRegion,
     ExitSelectKeepThenCycleNext,
@@ -147,6 +149,15 @@ pub enum KeyAction {
     TreeCollapse,
     TreeExpand,
     TreeActivate,
+    WorkflowNext,
+    WorkflowPrev,
+    WorkflowActivate,
+    OpenBlockPalette,
+    WorkflowDelete,
+    BlockPalettePrev,
+    BlockPaletteNext,
+    BlockPaletteApply,
+    CloseBlockPalette,
     Ignore,
 }
 
@@ -192,11 +203,11 @@ impl Shell {
     pub fn campaign_session() -> Self {
         Self {
             focused: PaneId::Tree,
-            expanded: [false, true, true, true],
+            expanded: [true, true, true, true],
             mode: InteractionMode::Idle,
             previous_mode: InteractionMode::Idle,
             overlay: Overlay::None,
-            workflow_h: 6,
+            workflow_h: 12,
             tree_w: 22,
             editspec_w: 48,
             tree_h: 8,
@@ -301,6 +312,10 @@ impl Shell {
     pub fn tree_focused(&self) -> bool {
         self.focused == PaneId::Tree
     }
+
+    pub fn workflow_focused(&self) -> bool {
+        self.focused == PaneId::Workflow
+    }
 }
 
 fn pane_index(pane: PaneId) -> usize {
@@ -322,9 +337,10 @@ pub const KEY_TABLE: &[(&str, &str)] = &[
     ("Ctrl+R", "Open Run Composer from any pane including Select; Ignore if Composer/Status or EditRegion is open"),
     ("h/l j/k w/a/s/d u/i [ ] v", "3D camera / viz (View pane Idle only; j/k rotate only when View is focused)"),
     ("x", "Enter Select (EditSpec Idle only)"),
-    ("Enter", "EditSpec Idle: empty form (or prefilled if a selection remains). Tree: load structure. Workflow / View: Ignore. Select: operate on the range"),
+    ("Enter", "EditSpec Idle: empty form (or prefilled if a selection remains). Tree: load structure. Workflow: load that node structure. View: Ignore. Select: operate on the range"),
     ("e", "Edit the focused existing region (EditSpec only)"),
     ("Tree: j/k h/l Enter", "Move / collapse / expand / load structure_path into View"),
+    ("Workflow: j/k Enter a d", "Move nodes; Enter/left-click loads structure. a / right-empty adds. d twice or right-box deletes when allowed"),
     ("Tree mouse", "▾/▸ toggles children only. Label selects; loads View only when structure_path exists. Wheel scrolls. One Line = one row"),
     ("Select: h/l H/L s [ ] 1-5", "Sequence cursor / boundary / segment / action shortcuts"),
     ("Right-click", "Selection or existing region: Action / Label menu"),
@@ -346,6 +362,7 @@ pub fn route_key(shell: &Shell, key: KeyEvent, has_selection: bool, can_run: boo
         }
         Overlay::RunComposer | Overlay::RunStatus => return route_run(key, ctrl),
         Overlay::ContextMenu => return route_context_menu(key),
+        Overlay::BlockPalette => return route_block_palette(key),
         Overlay::None => {}
     }
 
@@ -359,6 +376,7 @@ pub fn route_key(shell: &Shell, key: KeyEvent, has_selection: bool, can_run: boo
 fn route_run(key: KeyEvent, ctrl: bool) -> KeyAction {
     match key.code {
         KeyCode::Esc => KeyAction::CloseOverlay,
+        KeyCode::Enter => KeyAction::ConfirmDebugRun,
         KeyCode::Char('r') if ctrl => KeyAction::RunIgnore,
         _ => KeyAction::RunIgnore,
     }
@@ -370,6 +388,16 @@ fn route_context_menu(key: KeyEvent) -> KeyAction {
         KeyCode::Enter => KeyAction::ContextMenuApply,
         KeyCode::Up | KeyCode::Char('k') => KeyAction::ContextMenuPrev,
         KeyCode::Down | KeyCode::Char('j') => KeyAction::ContextMenuNext,
+        _ => KeyAction::Ignore,
+    }
+}
+
+fn route_block_palette(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => KeyAction::CloseBlockPalette,
+        KeyCode::Enter => KeyAction::BlockPaletteApply,
+        KeyCode::Up | KeyCode::Char('k') => KeyAction::BlockPalettePrev,
+        KeyCode::Down | KeyCode::Char('j') => KeyAction::BlockPaletteNext,
         _ => KeyAction::Ignore,
     }
 }
@@ -445,12 +473,15 @@ fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can
         KeyCode::Char('c') if ctrl => KeyAction::Quit,
         KeyCode::Char('x') if shell.editspec_focused() => KeyAction::EnterSelect,
         KeyCode::Enter if shell.tree_focused() => KeyAction::TreeActivate,
+        KeyCode::Enter if shell.workflow_focused() => KeyAction::WorkflowActivate,
         KeyCode::Enter if shell.editspec_focused() => KeyAction::OpenEmptyForm,
         KeyCode::Char('e') if shell.editspec_focused() => KeyAction::EditFocusedRegion,
         KeyCode::Esc if has_selection && shell.editspec_focused() => KeyAction::ClearSelection,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('j') | KeyCode::Down => {
-            if shell.tree_focused() {
+            if shell.workflow_focused() {
+                KeyAction::WorkflowNext
+            } else if shell.tree_focused() {
                 KeyAction::TreeNext
             } else if shell.editspec_focused() {
                 KeyAction::RegionNext
@@ -461,7 +492,9 @@ fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if shell.tree_focused() {
+            if shell.workflow_focused() {
+                KeyAction::WorkflowPrev
+            } else if shell.tree_focused() {
                 KeyAction::TreePrev
             } else if shell.editspec_focused() {
                 KeyAction::RegionPrev
@@ -503,8 +536,10 @@ fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can
         KeyCode::Char('w') if shell.view_focused() => KeyAction::Pan(0.0, 1.0),
         KeyCode::Char('s') if shell.editspec_focused() => KeyAction::RegionSplit,
         KeyCode::Char('s') if shell.view_focused() => KeyAction::Pan(0.0, -1.0),
+        KeyCode::Char('a') if shell.workflow_focused() => KeyAction::OpenBlockPalette,
         KeyCode::Char('a') if shell.editspec_focused() => KeyAction::RegionAdd,
         KeyCode::Char('a') if shell.view_focused() => KeyAction::Pan(-1.0, 0.0),
+        KeyCode::Char('d') if shell.workflow_focused() => KeyAction::WorkflowDelete,
         KeyCode::Char('d') if shell.editspec_focused() => KeyAction::RegionDelete,
         KeyCode::Char('d') if shell.view_focused() => KeyAction::Pan(1.0, 0.0),
         KeyCode::Char('+') | KeyCode::Char('=') if shell.view_focused() => KeyAction::ZoomIn,
@@ -651,7 +686,7 @@ mod tests {
         assert_eq!(shell.focused, PaneId::Tree);
         assert!(shell.is_expanded(PaneId::Tree));
         assert!(shell.is_expanded(PaneId::View));
-        assert!(!shell.is_expanded(PaneId::Workflow));
+        assert!(shell.is_expanded(PaneId::Workflow));
     }
 
     #[test]
@@ -663,7 +698,10 @@ mod tests {
         shell.focus(PaneId::View);
         assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::Ignore);
         shell.focus(PaneId::Workflow);
-        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::Ignore);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::WorkflowActivate);
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::WorkflowNext);
+        assert_eq!(route(&shell, key(KeyCode::Char('a'))), KeyAction::OpenBlockPalette);
+        assert_eq!(route(&shell, key(KeyCode::Char('d'))), KeyAction::WorkflowDelete);
         assert_eq!(route(&shell, key(KeyCode::Char('x'))), KeyAction::Ignore);
         assert_eq!(route(&shell, key(KeyCode::Char('e'))), KeyAction::Ignore);
     }
@@ -763,6 +801,7 @@ mod tests {
         assert_eq!(route(&tree, key_ctrl(KeyCode::Char('r'))), KeyAction::EnterRun);
         let mut run = Shell::pdb_session();
         run.open_overlay(Overlay::RunComposer);
+        assert_eq!(route(&run, key(KeyCode::Enter)), KeyAction::ConfirmDebugRun);
         assert_eq!(route(&run, key_ctrl(KeyCode::Char('r'))), KeyAction::RunIgnore);
         let mut form = Shell::pdb_session();
         form.enter_mode(InteractionMode::EditRegion);
@@ -832,6 +871,18 @@ mod tests {
         assert_eq!(route(&shell, key(KeyCode::Char('k'))), KeyAction::ContextMenuPrev);
         assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::ContextMenuApply);
         assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::CloseContextMenu);
+        assert_eq!(route(&shell, key(KeyCode::Char('q'))), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn block_palette_owns_jk_enter_esc() {
+        let mut shell = Shell::campaign_session();
+        shell.focus(PaneId::Workflow);
+        shell.open_overlay(Overlay::BlockPalette);
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::BlockPaletteNext);
+        assert_eq!(route(&shell, key(KeyCode::Char('k'))), KeyAction::BlockPalettePrev);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::BlockPaletteApply);
+        assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::CloseBlockPalette);
         assert_eq!(route(&shell, key(KeyCode::Char('q'))), KeyAction::Ignore);
     }
 

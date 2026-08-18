@@ -1,5 +1,6 @@
 mod app;
 mod bridge;
+mod debug_run;
 mod edit_history;
 mod event;
 mod model;
@@ -123,6 +124,7 @@ fn apply_key_action(
             app.sync_selection_overlay();
         }
         KeyAction::EnterRun => app.enter_run_mode(),
+        KeyAction::ConfirmDebugRun => app.confirm_debug_run(),
         KeyAction::OpenEmptyForm => app.edit_region_open_empty(),
         KeyAction::EditFocusedRegion => app.edit_region_start(),
         KeyAction::ClearSelection => {
@@ -888,6 +890,7 @@ fn main() -> Result<()> {
     app.output_path = cli.output.clone();
     app.active_panel = ActivePanel::EditSpec;
     if let Some(state_path) = &cli.state_file {
+        app.state_file = Some(state_path.clone());
         if let Ok(text) = std::fs::read_to_string(state_path) {
             match product_tree::load_studio_seed(&text) {
                 Ok(seed) => {
@@ -899,6 +902,9 @@ fn main() -> Result<()> {
                 }
                 Err(err) => log!(logfile, "product_tree: ignored seed ({err})"),
             }
+        }
+        if let Ok(meta) = std::fs::metadata(state_path) {
+            app.state_mtime = meta.modified().ok();
         }
     }
 
@@ -977,6 +983,7 @@ fn main() -> Result<()> {
         // Always poll the background interface thread, even during skipped
         // frames, so the result is absorbed as soon as it's available.
         app.poll_background_interface();
+        app.poll_studio_state();
 
         // Adaptive frame skipping: if the previous draw took longer than the
         // tick rate, skip frames proportionally.  User input always forces a

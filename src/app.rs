@@ -731,6 +731,9 @@ pub struct App {
     pub block_palette: Option<BlockPalette>,
     pub campaign_root: Option<String>,
     pub loaded_structure_path: Option<String>,
+    pub state_file: Option<String>,
+    pub state_mtime: Option<std::time::SystemTime>,
+    pub console_open: bool,
 }
 
 impl App {
@@ -927,10 +930,14 @@ impl App {
             block_palette: None,
             campaign_root: None,
             loaded_structure_path: None,
+            state_file: None,
+            state_mtime: None,
+            console_open: false,
         }
     }
 
     pub fn apply_studio_seed(&mut self, seed: StudioSeed) {
+        let first_seed = self.product_tree.is_empty();
         self.campaign_root = seed
             .campaign_root
             .or_else(|| seed.product_tree.campaign_root.clone());
@@ -938,13 +945,122 @@ impl App {
         self.workflow_status = seed.workflow_status;
         self.workflow_error = seed.workflow_error;
         self.workflow_graph = seed.workflow_graph;
-        self.tree_cursor = 0;
-        self.tree_scroll = 0;
-        self.workflow_cursor = 0;
-        self.workflow_delete_confirm = false;
-        if !self.product_tree.is_empty() {
-            self.shell = Shell::campaign_session();
+        if first_seed {
+            self.tree_cursor = 0;
+            self.tree_scroll = 0;
+            self.workflow_cursor = 0;
+            self.workflow_delete_confirm = false;
+            if !self.product_tree.is_empty() {
+                self.shell = Shell::campaign_session();
+            }
         }
+        if let Some(spec) = seed.edit_spec.as_deref() {
+            if !spec.is_empty() {
+                self.load_edit_spec_text(spec);
+            }
+        }
+        if let Some(status) = &self.workflow_status {
+            if let Some(index) = status
+                .nodes
+                .iter()
+                .position(|node| node.waiting && node.kind == "step")
+            {
+                self.workflow_cursor = index;
+            }
+        }
+        let _ = self.reload_view_from_tree();
+    }
+
+    pub fn reload_view_from_tree(&mut self) -> Result<bool, String> {
+        let selected = self.product_tree.selected_sample_id.clone();
+        let rows = self.product_tree.visible_rows();
+        let target = if let Some(id) = selected {
+            rows.iter().position(|(_, node)| node.sample_id == id)
+        } else {
+            rows.iter()
+                .rposition(|(_, node)| node.first_structure_path().is_some())
+        };
+        let Some(index) = target else {
+            return Ok(false);
+        };
+        self.tree_cursor = index;
+        self.activate_tree_row()
+    }
+
+    pub fn poll_studio_state(&mut self) -> bool {
+        let Some(path) = self.state_file.clone() else {
+            return false;
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        let modified = match meta.modified() {
+            Ok(time) => time,
+            Err(_) => return false,
+        };
+        if self.state_mtime == Some(modified) {
+            self.poll_console_hint();
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(seed) = crate::product_tree::load_studio_seed(&text) else {
+            return false;
+        };
+        self.state_mtime = Some(modified);
+        self.apply_studio_seed(seed);
+        self.poll_console_hint();
+        true
+    }
+
+    pub fn poll_console_hint(&mut self) {
+        let Some(root) = self.campaign_root.as_deref() else {
+            return;
+        };
+        let path = std::path::Path::new(root).join("console.jsonl");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        if let Some(hint) = crate::debug_run::last_console_hint(&text) {
+            self.status_banner = Some(hint);
+            self.console_open = true;
+        }
+    }
+
+    pub fn confirm_debug_run(&mut self) {
+        self.close_run_overlay();
+        match self.spawn_debug_run() {
+            Ok(()) => {
+                self.console_open = true;
+                self.status_banner = Some("waiting debug … (3s)".to_string());
+            }
+            Err(err) => {
+                self.status_banner = Some(err);
+            }
+        }
+    }
+
+    fn spawn_debug_run(&self) -> Result<(), String> {
+        let bin = self
+            .gemlib_bin
+            .as_deref()
+            .ok_or_else(|| "缺少 gemlib-bin".to_string())?;
+        let root = self
+            .campaign_root
+            .as_deref()
+            .ok_or_else(|| "缺少 campaign".to_string())?;
+        let recipe = crate::debug_run::campaign_recipe_path(root)
+            .ok_or_else(|| "campaign 里没有 run.yaml".to_string())?;
+        let argv = crate::debug_run::debug_run_argv(bin, &recipe, root);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if let Some(state) = &self.state_file {
+            cmd.env("GEMLIB_STUDIO_STATE", state);
+        }
+        cmd.spawn().map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     pub fn tree_visible_count(&self) -> usize {

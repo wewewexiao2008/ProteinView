@@ -489,7 +489,11 @@ fn display_block(node: &WorkflowNode) -> String {
 
 fn extra_note(node: &WorkflowNode) -> String {
     if node.waiting {
-        return "human".to_string();
+        return if node.kind == "gate" {
+            "human".to_string()
+        } else {
+            "running".to_string()
+        };
     }
     if node.needs_editspec && node.checks.editspec.ok {
         return node.editspec_note.clone();

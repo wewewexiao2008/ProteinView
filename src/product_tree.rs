@@ -5,11 +5,21 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::workflow::{WorkflowError, WorkflowStatus};
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StudioSeed {
     pub campaign_root: Option<String>,
     #[serde(default)]
     pub product_tree: ProductTree,
+    #[serde(default)]
+    pub workflow_status: Option<WorkflowStatus>,
+    #[serde(default)]
+    pub workflow_error: Option<WorkflowError>,
+    #[serde(default)]
+    pub workflow_graph: Option<serde_json::Value>,
+    #[serde(default)]
+    pub edit_spec: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -28,6 +38,8 @@ pub struct ProductTreeNode {
     pub parent_ids: Vec<String>,
     #[serde(default)]
     pub metrics: serde_json::Value,
+    #[serde(default)]
+    pub condition: serde_json::Value,
     #[serde(default)]
     pub label: String,
     pub structure_path: Option<String>,
@@ -87,6 +99,10 @@ impl ProductTree {
 }
 
 impl ProductTreeNode {
+    pub fn condition_node(&self) -> Option<&str> {
+        self.condition.get("node").and_then(|value| value.as_str())
+    }
+
     pub fn first_structure_path(&self) -> Option<&str> {
         if let Some(path) = self.structure_path.as_deref() {
             if !path.is_empty() {
@@ -157,6 +173,23 @@ mod tests {
         ]
       }
     }"#;
+
+    #[test]
+    fn seed_carries_edit_spec_for_pane_parse() {
+        let seed = load_studio_seed(
+            r#"{"edit_spec":"A1-10~","product_tree":{"roots":[]},"workflow_graph":{"loop":{"block":"loop"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(seed.edit_spec.as_deref(), Some("A1-10~"));
+        assert_eq!(
+            seed.workflow_graph
+                .as_ref()
+                .and_then(|value| value.get("loop"))
+                .and_then(|value| value.get("block"))
+                .and_then(|value| value.as_str()),
+            Some("loop")
+        );
+    }
 
     #[test]
     fn seed_follows_parent_ids_not_stage_paths() {

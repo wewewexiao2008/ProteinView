@@ -19,21 +19,22 @@ pub fn render_run_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup_area);
     let text = vec![
         Line::from(Span::styled(
-            " Run",
+            " Debug Run",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::raw(
-            " Fleet submit stays an overlay. GPU work is not launched",
+            " Enter places existing products after a 3s wait.",
         )),
         Line::from(Span::raw(
-            " from this laptop. Studio does not spawn RFD/MPNN/Fold wrappers.",
+            " Tree / View / Workflow / EditSpec re-parse the campaign.",
         )),
+        Line::from(Span::raw(" Fleet submit is refused for a debug campaign.")),
         Line::from(""),
         Line::from(Span::styled(
-            " Esc closes. Ctrl+R is ignored while this overlay is open.",
+            " Enter = Debug Run. Esc closes. Ctrl+R is ignored.",
             Style::default().fg(Color::DarkGray),
         )),
     ];

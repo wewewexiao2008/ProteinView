@@ -68,7 +68,21 @@ pub fn render_tree_pane(frame: &mut Frame, area: Rect, app: &App) {
             .as_deref()
             == Some(node.sample_id.as_str());
         let cursor = idx == app.tree_cursor;
-        let mut style = Style::default().fg(Color::Gray);
+        let linked = app
+            .focused_workflow_node()
+            .map(|wf| {
+                crate::workflow::tree_row_matches_node(
+                    &node.kind,
+                    node.condition_node(),
+                    wf,
+                )
+            })
+            .unwrap_or(true);
+        let mut style = Style::default().fg(if linked {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        });
         if selected {
             style = style.fg(Color::Cyan);
         }
@@ -201,6 +215,7 @@ mod tests {
             kind: kind.to_string(),
             parent_ids: Vec::new(),
             metrics,
+            condition: serde_json::Value::Null,
             label: String::new(),
             structure_path: None,
             expanded: true,

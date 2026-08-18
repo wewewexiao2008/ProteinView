@@ -28,9 +28,11 @@ pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
     }
     let spans = match app.shell.overlay {
         Overlay::Help => hint_line(&[("Esc/?", "close Help")]),
-        Overlay::RunComposer | Overlay::RunStatus => {
-            hint_line(&[("Esc", "close Run"), ("Ctrl+R", "ignored")])
-        }
+        Overlay::RunComposer | Overlay::RunStatus => hint_line(&[
+            ("Enter", "Debug Run"),
+            ("Esc", "close"),
+            ("Ctrl+R", "ignored"),
+        ]),
         Overlay::ContextMenu | Overlay::BlockPalette => hint_line(&[
             ("j/k", "item"),
             ("Enter", "apply"),
