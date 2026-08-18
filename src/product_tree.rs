@@ -86,6 +86,17 @@ impl ProductTree {
     }
 }
 
+impl ProductTreeNode {
+    pub fn first_structure_path(&self) -> Option<&str> {
+        if let Some(path) = self.structure_path.as_deref() {
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+        self.children.iter().find_map(Self::first_structure_path)
+    }
+}
+
 pub fn load_studio_seed(text: &str) -> Result<StudioSeed, serde_json::Error> {
     serde_json::from_str(text)
 }
@@ -188,6 +199,17 @@ mod tests {
         );
         let protein = crate::parser::pdb::load_structure(path.to_str().unwrap()).unwrap();
         assert!(protein.residue_count() >= 1);
+    }
+
+    #[test]
+    fn sequence_row_uses_first_descendant_structure() {
+        let seed = load_studio_seed(SEED).unwrap();
+        let seq = seed.product_tree.visible_rows()[1].1;
+        assert!(seq.structure_path.is_none());
+        assert_eq!(
+            seq.first_structure_path(),
+            Some("outputs/prediction.pdb")
+        );
     }
 
     #[test]

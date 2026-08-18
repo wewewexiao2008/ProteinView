@@ -27,7 +27,7 @@ pub fn render_help_overlay(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  One exclusive pane focus. Modes: View | Select | EditRegion | Run",
+            "  Overlay → EditSpec Select/EditRegion → pane Idle → session chrome",
             Style::default().fg(Color::Gray),
         )),
         Line::from(""),

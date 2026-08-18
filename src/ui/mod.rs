@@ -1,4 +1,5 @@
 pub mod chrome;
+pub mod context_menu;
 pub mod editspec_panel;
 pub mod header;
 pub mod help_overlay;

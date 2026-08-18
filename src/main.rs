@@ -22,8 +22,10 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use app::{ActivePanel, App, AppConfig, ConnectionType, LayoutMode, RenderMode, VizMode};
-use shell::{InteractionMode, KeyAction, PaneId, route_key};
+use app::{
+    ActivePanel, App, AppConfig, ConnectionType, ContextTarget, LayoutMode, RenderMode, VizMode,
+};
+use shell::{InteractionMode, KeyAction, Overlay, PaneId, route_key};
 
 macro_rules! log {
     ($file:expr, $($arg:tt)*) => {
@@ -108,6 +110,12 @@ fn apply_key_action(
         KeyAction::Quit => app.should_quit = true,
         KeyAction::CyclePaneNext => app.shell.cycle_focus_next(),
         KeyAction::CyclePanePrev => app.shell.cycle_focus_prev(),
+        KeyAction::ExitSelectKeepThenCycleNext => {
+            app.shell.exit_select_keep_then_cycle(true);
+        }
+        KeyAction::ExitSelectKeepThenCyclePrev => {
+            app.shell.exit_select_keep_then_cycle(false);
+        }
         KeyAction::ToggleCollapse => app.shell.toggle_collapse(),
         KeyAction::EnterSelect => {
             app.enter_select_mode();
@@ -116,15 +124,26 @@ fn apply_key_action(
         KeyAction::EnterRun => app.enter_run_mode(),
         KeyAction::OpenEmptyForm => app.edit_region_open_empty(),
         KeyAction::EditFocusedRegion => app.edit_region_start(),
-        KeyAction::RestorePreviousMode => {
-            app.shell.restore_previous_mode();
-        }
         KeyAction::ClearSelection => {
+            app.abandon_edit_form();
+            app.status_banner = None;
+            app.pending_overlap_action = None;
             app.seq_selection.clear();
+            if app.shell.mode == InteractionMode::Select {
+                app.shell.enter_idle();
+            }
             app.sync_selection_overlay();
         }
-        KeyAction::CloseHelp => app.show_help = false,
-        KeyAction::ToggleHelp => app.show_help = !app.show_help,
+        KeyAction::CloseOverlay => app.close_run_overlay(),
+        KeyAction::CloseContextMenu => {
+            app.close_context_menu();
+            app.status_banner = None;
+        }
+        KeyAction::ContextMenuNext => app.context_menu_move(1),
+        KeyAction::ContextMenuPrev => app.context_menu_move(-1),
+        KeyAction::ContextMenuApply => app.apply_context_menu(),
+        KeyAction::CloseHelp => app.close_help_overlay(),
+        KeyAction::ToggleHelp => app.toggle_help_overlay(),
         KeyAction::RotateX(d) => app.camera.rotate_x(d),
         KeyAction::RotateY(d) => app.camera.rotate_y(d),
         KeyAction::RotateZ(d) => app.camera.rotate_z(d),
@@ -160,12 +179,13 @@ fn apply_key_action(
                 .map(|r| r.len())
                 .unwrap_or(0);
             if region_count > 0 {
-                app.focused_region = (app.focused_region + 1).min(region_count - 1);
+                let idx = (app.focused_region + 1).min(region_count - 1);
+                app.focus_region(idx, false);
             }
         }
         KeyAction::RegionPrev => {
             if app.focused_region > 0 {
-                app.focused_region -= 1;
+                app.focus_region(app.focused_region - 1, false);
             }
         }
         KeyAction::RegionAdd => app.edit_region_add(),
@@ -180,18 +200,8 @@ fn apply_key_action(
             if !residues.is_empty() {
                 app.seq_selection.move_cursor(&residues, delta);
                 let cursor = app.seq_selection.cursor;
-                if delta < 0 && cursor < app.seq_h_scroll as usize {
-                    app.seq_h_scroll = cursor as u16;
-                }
-                if delta > 0 {
-                    if let Some(sidebar) = app.last_sidebar_rect {
-                        let visible = sidebar.width.saturating_sub(2) as usize;
-                        if cursor >= app.seq_h_scroll as usize + visible {
-                            app.seq_h_scroll =
-                                cursor.saturating_sub(visible.saturating_sub(1)) as u16;
-                        }
-                    }
-                }
+                app.ensure_seq_visible(cursor);
+                app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
             }
         }
@@ -199,6 +209,7 @@ fn apply_key_action(
             let residues = app.current_residues().to_vec();
             if !residues.is_empty() {
                 app.seq_selection.expand_start(&residues, delta);
+                app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
             }
         }
@@ -206,6 +217,7 @@ fn apply_key_action(
             let residues = app.current_residues().to_vec();
             if !residues.is_empty() {
                 app.seq_selection.expand_end(&residues, delta);
+                app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
             }
         }
@@ -214,6 +226,7 @@ fn apply_key_action(
             if !residues.is_empty() {
                 let cursor = app.seq_selection.cursor;
                 app.seq_selection.select_segment(&residues, cursor);
+                app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
             }
         }
@@ -221,6 +234,7 @@ fn apply_key_action(
             let residues = app.current_residues().to_vec();
             if !residues.is_empty() {
                 app.seq_selection.jump_segment(&residues, dir);
+                app.sync_focused_region_from_selection();
                 app.sync_selection_overlay();
             }
         }
@@ -254,6 +268,7 @@ fn apply_key_action(
         KeyAction::SeqActionShortcut(action) => {
             if let Some(msg) = app.apply_action_shortcut(action) {
                 app.edit_state.validation_error = None;
+                app.status_banner = Some(msg.clone());
                 log!(logfile, "action shortcut: {}", msg);
             }
             app.revalidate();
@@ -301,6 +316,15 @@ fn apply_key_action(
 }
 
 /// Handle mouse events for sidebar interaction.
+fn chrome_rects(app: &App) -> ui::chrome::ChromeRects {
+    ui::chrome::ChromeRects {
+        workflow: app.last_workflow_rect.unwrap_or_default(),
+        tree: app.last_tree_rect.unwrap_or_default(),
+        view: app.last_view_rect.unwrap_or_default(),
+        editspec: app.last_sidebar_rect.unwrap_or_default(),
+    }
+}
+
 fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::fs::File>) {
     app.mouse_event_count += 1;
     log!(
@@ -312,76 +336,149 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
         app.mouse_event_count
     );
     match me.kind {
-        MouseEventKind::ScrollUp => {
-            if app.active_panel != ActivePanel::None {
-                app.panel_scroll = app.panel_scroll.saturating_sub(1);
+        MouseEventKind::Down(MouseButton::Left)
+            if app.shell.overlay == Overlay::ContextMenu =>
+        {
+            if let Some(menu) = app.context_menu.as_ref() {
+                if let Some(idx) = ui::context_menu::hit_test_item(menu, me.column, me.row) {
+                    if let Some(menu) = app.context_menu.as_mut() {
+                        menu.cursor = idx;
+                    }
+                    app.apply_context_menu();
+                    return;
+                }
+            }
+            app.close_context_menu();
+            return;
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            if matches!(
+                app.shell.overlay,
+                Overlay::Help | Overlay::RunComposer | Overlay::RunStatus
+            ) {
+                return;
+            }
+            if app.shell.overlay == Overlay::ContextMenu {
+                app.close_context_menu();
+            }
+            if ui::chrome::pane_at(&chrome_rects(app), me.column, me.row) == Some(PaneId::EditSpec)
+            {
+                if let Some(sidebar_rect) = app.last_sidebar_rect {
+                    handle_sidebar_right_click(app, me.row, me.column, sidebar_rect, logfile);
+                }
             }
         }
-        MouseEventKind::ScrollDown => {
-            if app.active_panel != ActivePanel::None {
-                let max_scroll = max_panel_scroll(app);
-                app.panel_scroll = app.panel_scroll.saturating_add(1).min(max_scroll);
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            match ui::chrome::pane_at(&chrome_rects(app), me.column, me.row) {
+                Some(PaneId::View) => {
+                    if me.kind == MouseEventKind::ScrollUp {
+                        app.camera.zoom_in();
+                    } else {
+                        app.camera.zoom_out();
+                    }
+                }
+                Some(PaneId::EditSpec) => {
+                    if me.kind == MouseEventKind::ScrollUp {
+                        app.panel_scroll = app.panel_scroll.saturating_sub(1);
+                    } else {
+                        let max_scroll = max_panel_scroll(app);
+                        app.panel_scroll = app.panel_scroll.saturating_add(1).min(max_scroll);
+                    }
+                }
+                Some(PaneId::Tree) => {
+                    if me.kind == MouseEventKind::ScrollUp {
+                        app.tree_scroll = app.tree_scroll.saturating_sub(1);
+                    } else {
+                        app.tree_scroll = app
+                            .tree_scroll
+                            .saturating_add(1)
+                            .min(app.max_tree_scroll());
+                    }
+                }
+                _ => {}
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(pane) = ui::chrome::pane_at(
-                &ui::chrome::ChromeRects {
-                    workflow: app.last_workflow_rect.unwrap_or_default(),
-                    tree: app.last_tree_rect.unwrap_or_default(),
-                    view: app.last_view_rect.unwrap_or_default(),
-                    editspec: app.last_sidebar_rect.unwrap_or_default(),
-                },
-                me.column,
-                me.row,
-            ) {
-                app.shell.focus(pane);
-                if pane == PaneId::Tree {
-                    if let Some(tree_rect) = app.last_tree_rect {
-                        let row = me.row.saturating_sub(tree_rect.y.saturating_add(1)) as usize;
-                        if row < app.tree_visible_count() {
-                            app.tree_cursor = row;
-                            if let Err(err) = app.activate_tree_row() {
-                                log!(logfile, "tree click activate failed: {err}");
-                            }
+            if app.shell.overlay.is_open() {
+                return;
+            }
+            app.view_drag_last = None;
+            app.chrome_drag = None;
+            let rects = chrome_rects(app);
+            if let Some(pane) = ui::chrome::fold_pane_at(&rects, me.column, me.row) {
+                app.pointer_focus_pane(pane);
+                app.shell.toggle_pane(pane);
+                return;
+            }
+            if let Some(drag) = ui::chrome::divider_at(&rects, app.layout_mode, me.column, me.row)
+            {
+                app.chrome_drag = Some(drag);
+                return;
+            }
+            if let Some(pane) = ui::chrome::pane_at(&rects, me.column, me.row) {
+                app.pointer_focus_pane(pane);
+                match pane {
+                    PaneId::Tree => {
+                        if let Err(err) = app.handle_tree_click(me.column, me.row) {
+                            log!(logfile, "tree click failed: {err}");
                         }
                     }
-                }
-            }
-            if let Some(sidebar_rect) = app.last_sidebar_rect {
-                if me.column >= sidebar_rect.x
-                    && me.column < sidebar_rect.x + sidebar_rect.width
-                    && me.row >= sidebar_rect.y
-                    && me.row < sidebar_rect.y + sidebar_rect.height
-                {
-                    handle_sidebar_click(app, me.row, me.column, sidebar_rect, logfile);
+                    PaneId::EditSpec => {
+                        if let Some(sidebar_rect) = app.last_sidebar_rect {
+                            handle_sidebar_click(app, me.row, me.column, sidebar_rect, logfile);
+                        }
+                    }
+                    PaneId::View => {
+                        app.seq_selection.dragging = false;
+                        app.view_drag_last = Some((me.column, me.row));
+                    }
+                    PaneId::Workflow => {}
                 }
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if app.shell.overlay.is_open() {
+                return;
+            }
+            if let Some(drag) = app.chrome_drag {
+                let rects = chrome_rects(app);
+                ui::chrome::apply_drag(&mut app.shell, drag, &rects, me.column, me.row);
+                return;
+            }
             if app.seq_selection.dragging {
                 if let Some(sidebar_rect) = app.last_sidebar_rect {
-                    if me.column >= sidebar_rect.x
-                        && me.column < sidebar_rect.x + sidebar_rect.width
-                    {
-                        let col_offset = me.column.saturating_sub(sidebar_rect.x) as usize;
-                        let residue_idx = app.seq_h_scroll as usize + col_offset;
-                        let chain = app.protein.chains.get(app.current_chain);
-                        let max_res = chain.map(|c| c.residues.len()).unwrap_or(0);
-                        if residue_idx < max_res {
-                            app.seq_selection.end = Some(residue_idx);
-                            app.seq_selection.active = true;
+                    if let Some((chain_idx, hit)) = ui::editspec_panel::hit_test_sequences(
+                        sidebar_rect,
+                        me.column,
+                        me.row,
+                        &app.seq_blocks,
+                        app.panel_scroll,
+                    ) {
+                        if chain_idx == app.current_chain {
+                            let idx = match hit {
+                                ui::editspec_panel::SeqHit::Letter(i)
+                                | ui::editspec_panel::SeqHit::SecondaryStructure(i)
+                                | ui::editspec_panel::SeqHit::ActionMarker(i) => i,
+                            };
+                            let max_res = app.current_residues().len();
+                            app.seq_selection.drag_to(idx, max_res);
+                            app.ensure_seq_visible(idx);
+                            app.sync_focused_region_from_selection();
                             app.enter_select_mode();
                             app.sync_selection_overlay();
                         }
                     }
                 }
+                return;
+            }
+            if app.view_drag_last.is_some() {
+                app.apply_view_drag(me.column, me.row);
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // End drag
-            if app.seq_selection.dragging {
-                app.seq_selection.dragging = false;
-            }
+            app.seq_selection.dragging = false;
+            app.view_drag_last = None;
+            app.chrome_drag = None;
         }
         _ => {}
     }
@@ -390,15 +487,11 @@ fn handle_mouse_event(app: &mut App, me: MouseEvent, logfile: &mut Option<std::f
 /// Calculate the maximum scroll offset for the current panel.
 /// Prevents scrolling past the last visible item.
 fn max_panel_scroll(app: &App) -> u16 {
-    if app.panel_item_count == 0 || app.last_sidebar_rect.is_none() {
-        return 0;
-    }
-    let sidebar_height = app
+    let view_h = app
         .last_sidebar_rect
-        .map(|r| r.height)
+        .map(|r| r.height.saturating_sub(2))
         .unwrap_or(0);
-    let total_content = app.panel_click_header + app.panel_item_count as u16;
-    total_content.saturating_sub(sidebar_height)
+    app.panel_content_lines.saturating_sub(view_h)
 }
 
 /// Handle a click inside the sidebar area.
@@ -409,50 +502,124 @@ fn handle_sidebar_click(
     sidebar_rect: Rect,
     logfile: &mut Option<std::fs::File>,
 ) {
-    // Convert absolute row to panel-relative row, then add scroll offset
-    // to account for the Paragraph's .scroll() displacement
-    let item_row = row.saturating_sub(sidebar_rect.y).saturating_add(app.panel_scroll);
+    if app.shell.focused != PaneId::EditSpec {
+        return;
+    }
 
-    match app.shell.focused {
-        PaneId::EditSpec | PaneId::View => {
-            // Check if click is in the sequence area (on or after the sequence line)
-            let seq_row = app.seq_line_row;
-            if seq_row > 0 && item_row == seq_row {
-                // Click on the sequence line: select the residue at this column.
-                let col_offset = col.saturating_sub(sidebar_rect.x) as usize;
-                let residue_idx = app.seq_h_scroll as usize + col_offset;
-                let chain = app.protein.chains.get(app.current_chain);
-                if let Some(c) = chain {
-                    if residue_idx < c.residues.len() {
-                        app.seq_selection.click(&c.residues, residue_idx);
-                        app.enter_select_mode();
-                        app.sync_selection_overlay();
-                        log!(
-                            logfile,
-                            "seq_click: residue_idx={} segment=({:?})",
-                            residue_idx,
-                            app.seq_selection.range()
-                        );
-                    }
-                }
+    if !app.current_residues().is_empty() || !app.seq_blocks.is_empty() {
+        match ui::editspec_panel::hit_test_sequences(
+            sidebar_rect,
+            col,
+            row,
+            &app.seq_blocks,
+            app.panel_scroll,
+        ) {
+            Some((chain_idx, ui::editspec_panel::SeqHit::Letter(idx))) => {
+                app.set_current_chain(chain_idx);
+                let residues = app.current_residues().to_vec();
+                app.seq_selection.click(&residues, idx);
+                app.ensure_seq_visible(idx);
+                app.sync_focused_region_from_selection();
+                app.enter_select_mode();
+                app.sync_selection_overlay();
+                log!(
+                    logfile,
+                    "seq_click: residue_idx={} range={:?}",
+                    idx,
+                    app.seq_selection.range()
+                );
                 return;
             }
-
-            // Otherwise, check region list clicks
-            let header = app.panel_click_header;
-            if item_row >= header && app.panel_item_count > 0 {
-                let region_idx = (item_row - header) as usize;
-                if region_idx < app.panel_item_count {
-                    app.focused_region = region_idx;
-                    log!(
-                        logfile,
-                        "sidebar_click: panel=EditSpec region_idx={}",
-                        region_idx
-                    );
-                }
+            Some((chain_idx, ui::editspec_panel::SeqHit::SecondaryStructure(idx))) => {
+                app.set_current_chain(chain_idx);
+                let residues = app.current_residues().to_vec();
+                app.seq_selection.select_segment(&residues, idx);
+                app.ensure_seq_visible(idx);
+                app.sync_focused_region_from_selection();
+                app.enter_select_mode();
+                app.sync_selection_overlay();
+                log!(
+                    logfile,
+                    "ss_click: residue_idx={} segment={:?}",
+                    idx,
+                    app.seq_selection.range()
+                );
+                return;
             }
+            Some((_, ui::editspec_panel::SeqHit::ActionMarker(_))) => return,
+            None => {}
         }
-        _ => {}
+    }
+
+    let inner = ui::editspec_panel::sidebar_inner(sidebar_rect);
+    let item_row = row.saturating_sub(inner.y).saturating_add(app.panel_scroll);
+    let header = app.panel_click_header;
+    if item_row >= header && app.panel_item_count > 0 {
+        let region_idx = (item_row - header) as usize;
+        if region_idx < app.panel_item_count {
+            app.focus_region(region_idx, true);
+            log!(
+                logfile,
+                "sidebar_click: panel=EditSpec region_idx={}",
+                region_idx
+            );
+        }
+    }
+}
+
+fn handle_sidebar_right_click(
+    app: &mut App,
+    row: u16,
+    col: u16,
+    sidebar_rect: Rect,
+    logfile: &mut Option<std::fs::File>,
+) {
+    if !app.seq_blocks.is_empty() {
+        match ui::editspec_panel::hit_test_sequences(
+            sidebar_rect,
+            col,
+            row,
+            &app.seq_blocks,
+            app.panel_scroll,
+        ) {
+            Some((chain_idx, ui::editspec_panel::SeqHit::Letter(idx)))
+            | Some((chain_idx, ui::editspec_panel::SeqHit::SecondaryStructure(idx))) => {
+                app.set_current_chain(chain_idx);
+                let residues = app.current_residues().to_vec();
+                if app.seq_selection.contains(idx) {
+                    app.enter_select_mode();
+                    app.open_context_menu(col, row, ContextTarget::Selection);
+                    log!(logfile, "context_menu: selection at residue {idx}");
+                    return;
+                }
+                if let Some(region_idx) = app.region_index_covering_residue(idx) {
+                    app.focus_region(region_idx, false);
+                    app.open_context_menu(col, row, ContextTarget::Region(region_idx));
+                    log!(logfile, "context_menu: region {region_idx} at residue {idx}");
+                    return;
+                }
+                app.seq_selection.click(&residues, idx);
+                app.enter_select_mode();
+                app.sync_selection_overlay();
+                app.open_context_menu(col, row, ContextTarget::Selection);
+                log!(logfile, "context_menu: new selection at residue {idx}");
+                return;
+            }
+            Some((_, ui::editspec_panel::SeqHit::ActionMarker(_))) => return,
+            None => {}
+        }
+    }
+
+    let inner = ui::editspec_panel::sidebar_inner(sidebar_rect);
+    let item_row = row.saturating_sub(inner.y).saturating_add(app.panel_scroll);
+    let header = app.panel_click_header;
+    if item_row >= header && app.panel_item_count > 0 {
+        let region_idx = (item_row - header) as usize;
+        if region_idx < app.panel_item_count {
+            app.focus_region(region_idx, true);
+            app.open_context_menu(col, row, ContextTarget::Region(region_idx));
+            log!(logfile, "context_menu: region list {region_idx}");
+        }
     }
 }
 
@@ -737,8 +904,8 @@ fn main() -> Result<()> {
                     let action = route_key(
                         &app.shell,
                         key,
-                        app.show_help,
                         app.seq_selection.active,
+                        app.can_run(),
                     );
                     apply_key_action(&mut app, action, &mut logfile);
                 }
@@ -852,11 +1019,19 @@ fn main() -> Result<()> {
             ui::statusbar::render_statusbar(frame, outer[2], &app);
             ui::helpbar::render_helpbar(frame, outer[3], &app);
 
-            if app.shell.mode == InteractionMode::Run {
-                ui::run_overlay::render_run_overlay(frame, frame.area());
-            }
-            if app.show_help {
-                ui::help_overlay::render_help_overlay(frame, frame.area());
+            match app.shell.overlay {
+                Overlay::RunComposer | Overlay::RunStatus => {
+                    ui::run_overlay::render_run_overlay(frame, frame.area());
+                }
+                Overlay::Help => {
+                    ui::help_overlay::render_help_overlay(frame, frame.area());
+                }
+                Overlay::ContextMenu => {
+                    if let Some(menu) = app.context_menu.as_mut() {
+                        ui::context_menu::render_context_menu(frame, frame.area(), menu);
+                    }
+                }
+                Overlay::None => {}
             }
         })?;
         last_draw_duration = draw_start.elapsed();

@@ -1,5 +1,6 @@
 use std::sync::mpsc;
 
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui_image::picker::Picker;
 
@@ -8,7 +9,7 @@ use crate::product_tree::{ProductTree, StudioSeed, resolve_structure_path};
 use crate::edit_history::{
     EditHistory, HistoryEntry, ValidationIssue, validate_regions,
 };
-use crate::shell::{self, InteractionMode, Shell, parse_compact_regions, parse_direct_range};
+use crate::shell::{self, InteractionMode, Overlay, PaneId, Shell, parse_compact_regions, parse_direct_range};
 use crate::model::interface::{InterfaceAnalysis, analyze_binding_pockets, analyze_interface};
 use crate::model::protein::Protein;
 use crate::render::camera::Camera;
@@ -249,11 +250,29 @@ impl SeqSelection {
         }
     }
 
-    /// Set cursor position and begin selection from a mouse click.
+    /// Select an inclusive residue-index range. Missing sequence maps to empty.
+    pub fn select_range(&mut self, start: usize, end: usize, max: usize) {
+        if max == 0 {
+            self.clear();
+            return;
+        }
+        let last = max - 1;
+        let start = start.min(last);
+        let end = end.min(last);
+        self.start = Some(start.min(end));
+        self.end = Some(start.max(end));
+        self.cursor = start.min(end);
+        self.active = true;
+        self.dragging = false;
+    }
+
+    /// Set cursor on the clicked residue and begin an arbitrary-range drag.
     pub fn click(&mut self, residues: &[crate::model::protein::Residue], idx: usize) {
         if idx < residues.len() {
             self.cursor = idx;
-            self.select_segment(residues, idx);
+            self.start = Some(idx);
+            self.end = Some(idx);
+            self.active = true;
             self.dragging = true;
         }
     }
@@ -338,6 +357,8 @@ pub struct EditState {
     pub validation_error: Option<String>,
     /// Confirmation state for delete: true after first 'd', awaiting second 'd'.
     pub delete_confirm: bool,
+    /// First overlap save is a warning; second Enter replaces overlapping regions.
+    pub overlap_replace_armed: bool,
 }
 
 impl Default for EditState {
@@ -354,8 +375,62 @@ impl Default for EditState {
             draft_label: String::new(),
             validation_error: None,
             delete_confirm: false,
+            overlap_replace_armed: false,
         }
     }
+}
+
+/// One chain's wrapped sequence block in the EditSpec column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeqChainBlock {
+    pub chain_idx: usize,
+    pub start_row: u16,
+    pub per_line: usize,
+    pub wrap_lines: usize,
+    pub residue_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextTarget {
+    Selection,
+    Region(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextItem {
+    Header(&'static str),
+    Action(&'static str),
+    Label(&'static str),
+    EditRange,
+    Delete,
+    ReplaceOverlap,
+}
+
+impl ContextItem {
+    pub fn selectable(&self) -> bool {
+        !matches!(self, Self::Header(_))
+    }
+
+    pub fn caption(&self) -> String {
+        match self {
+            Self::Header(title) => format!("── {title} ──"),
+            Self::Action(name) => format!(" {name}"),
+            Self::Label(name) => format!(" {name}"),
+            Self::EditRange => " Edit range".to_string(),
+            Self::Delete => " Delete region".to_string(),
+            Self::ReplaceOverlap => " Replace overlapping".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub col: u16,
+    pub row: u16,
+    pub cursor: usize,
+    pub items: Vec<ContextItem>,
+    pub target: ContextTarget,
+    pub last_rect: Rect,
 }
 
 /// Predefined label names for the label/tag system.
@@ -536,7 +611,6 @@ pub struct App {
     pub viz_mode: VizMode,
     pub current_chain: usize,
     pub render_mode: RenderMode,
-    pub show_help: bool,
     pub show_ligands: bool,
     /// Which sidebar panel is currently active (replaces the old `show_interface` bool).
     pub active_panel: ActivePanel,
@@ -603,15 +677,28 @@ pub struct App {
     pub edit_history: EditHistory,
     /// Cached validation issues, recomputed on every state change.
     pub validation_issues: Vec<ValidationIssue>,
-    /// Horizontal scroll offset for the Sequence panel (in characters).
+    /// Horizontal scroll offset for the Sequence panel (unused after wrap).
     pub seq_h_scroll: u16,
+    /// Residues per wrapped sequence line (25 or 50).
+    pub seq_per_line: usize,
+    /// Number of wrapped sequence blocks this frame.
+    pub seq_wrap_lines: usize,
+    /// One wrap block per chain shown in the EditSpec sequence column.
+    pub seq_blocks: Vec<SeqChainBlock>,
+    /// Total EditSpec content lines, for vertical scroll clamp.
+    pub panel_content_lines: u16,
     /// Selection state for the Sequence panel.
     pub seq_selection: SeqSelection,
+    pub context_menu: Option<ContextMenu>,
+    pub status_banner: Option<String>,
+    pub pending_overlap_action: Option<String>,
     /// Debug counter: total mouse events received (shown in statusbar when > 0).
     pub mouse_event_count: u64,
     /// Row (within the sidebar) where the sequence line is rendered.
     /// Updated each frame by the editspec panel renderer for mouse hit-testing.
     pub seq_line_row: u16,
+    /// Content line index of the secondary-structure row (not scroll-adjusted).
+    pub ss_line_row: u16,
     /// Four-pane Studio chrome and exclusive-focus router.
     pub shell: Shell,
     /// Optional `--output` path for compact EditSpec on exit.
@@ -621,8 +708,13 @@ pub struct App {
     pub last_workflow_rect: Option<ratatui::layout::Rect>,
     pub last_tree_rect: Option<ratatui::layout::Rect>,
     pub last_view_rect: Option<ratatui::layout::Rect>,
+    /// Last View-pane mouse cell while rotating the camera.
+    pub view_drag_last: Option<(u16, u16)>,
+    /// Shared-border resize in progress.
+    pub chrome_drag: Option<crate::ui::chrome::ChromeDrag>,
     pub product_tree: ProductTree,
     pub tree_cursor: usize,
+    pub tree_scroll: u16,
     pub campaign_root: Option<String>,
     pub loaded_structure_path: Option<String>,
 }
@@ -760,7 +852,6 @@ impl App {
             viz_mode,
             current_chain: 0,
             render_mode,
-            show_help: false,
             show_ligands: true,
             active_panel: ActivePanel::None,
             show_interactions: false,
@@ -791,17 +882,28 @@ impl App {
             edit_history: EditHistory::default(),
             validation_issues: Vec::new(),
             seq_h_scroll: 0,
+            seq_per_line: 25,
+            seq_wrap_lines: 0,
+            seq_blocks: Vec::new(),
+            panel_content_lines: 0,
             seq_selection: SeqSelection::default(),
+            context_menu: None,
+            status_banner: None,
+            pending_overlap_action: None,
             mouse_event_count: 0,
-            seq_line_row: 0,
+            seq_line_row: u16::MAX,
+            ss_line_row: u16::MAX,
             shell: Shell::pdb_session(),
             output_path: None,
             gemlib_bin: None,
             last_workflow_rect: None,
             last_tree_rect: None,
             last_view_rect: None,
+            view_drag_last: None,
+            chrome_drag: None,
             product_tree: ProductTree::default(),
             tree_cursor: 0,
+            tree_scroll: 0,
             campaign_root: None,
             loaded_structure_path: None,
         }
@@ -813,6 +915,7 @@ impl App {
             .or_else(|| seed.product_tree.campaign_root.clone());
         self.product_tree = seed.product_tree;
         self.tree_cursor = 0;
+        self.tree_scroll = 0;
         if !self.product_tree.is_empty() {
             self.shell = Shell::campaign_session();
         }
@@ -830,6 +933,7 @@ impl App {
         }
         let next = self.tree_cursor as isize + delta;
         self.tree_cursor = next.clamp(0, count as isize - 1) as usize;
+        self.ensure_tree_visible();
     }
 
     pub fn tree_set_expanded(&mut self, expanded: bool) {
@@ -840,13 +944,89 @@ impl App {
             .map(|(_depth, node)| node.sample_id.clone());
         if let Some(sample_id) = sample_id {
             self.product_tree.set_expanded(&sample_id, expanded);
-            let count = self.tree_visible_count();
-            if count == 0 {
-                self.tree_cursor = 0;
-            } else if self.tree_cursor >= count {
-                self.tree_cursor = count - 1;
+            self.reindex_tree_cursor(&sample_id);
+            self.ensure_tree_visible();
+        }
+    }
+
+    pub fn handle_tree_click(&mut self, col: u16, row: u16) -> Result<(), String> {
+        let Some(rect) = self.last_tree_rect else {
+            return Ok(());
+        };
+        let meta: Vec<crate::ui::tree_pane::TreeRowHit> = self
+            .product_tree
+            .visible_rows()
+            .iter()
+            .map(|(depth, node)| crate::ui::tree_pane::TreeRowHit {
+                depth: *depth,
+                has_children: !node.children.is_empty(),
+            })
+            .collect();
+        let Some((idx, hit)) =
+            crate::ui::tree_pane::hit_test(rect, col, row, self.tree_scroll, &meta)
+        else {
+            return Ok(());
+        };
+        match hit {
+            crate::ui::tree_pane::TreeHit::Fold => {
+                let Some((sample_id, expanded)) = self
+                    .product_tree
+                    .visible_rows()
+                    .get(idx)
+                    .map(|(_depth, node)| (node.sample_id.clone(), node.expanded))
+                else {
+                    return Ok(());
+                };
+                self.product_tree.set_expanded(&sample_id, !expanded);
+                self.reindex_tree_cursor(&sample_id);
+                self.ensure_tree_visible();
+            }
+            crate::ui::tree_pane::TreeHit::Label => {
+                self.tree_cursor = idx;
+                self.activate_tree_row()?;
+                self.ensure_tree_visible();
             }
         }
+        Ok(())
+    }
+
+    pub fn max_tree_scroll(&self) -> u16 {
+        let view_h = self
+            .last_tree_rect
+            .map(|r| r.height.saturating_sub(2))
+            .unwrap_or(0);
+        (self.tree_visible_count() as u16).saturating_sub(view_h)
+    }
+
+    fn reindex_tree_cursor(&mut self, sample_id: &str) {
+        if let Some(idx) = self
+            .product_tree
+            .visible_rows()
+            .iter()
+            .position(|(_depth, node)| node.sample_id == sample_id)
+        {
+            self.tree_cursor = idx;
+            return;
+        }
+        let count = self.tree_visible_count();
+        self.tree_cursor = count.saturating_sub(1);
+    }
+
+    fn ensure_tree_visible(&mut self) {
+        let view_h = self
+            .last_tree_rect
+            .map(|r| r.height.saturating_sub(2))
+            .unwrap_or(0);
+        if view_h == 0 {
+            return;
+        }
+        let cursor = self.tree_cursor as u16;
+        if cursor < self.tree_scroll {
+            self.tree_scroll = cursor;
+        } else if cursor >= self.tree_scroll.saturating_add(view_h) {
+            self.tree_scroll = cursor.saturating_sub(view_h.saturating_sub(1));
+        }
+        self.tree_scroll = self.tree_scroll.min(self.max_tree_scroll());
     }
 
     pub fn replace_protein(&mut self, mut protein: Protein) {
@@ -869,7 +1049,7 @@ impl App {
             .map(|(_depth, node)| {
                 (
                     node.sample_id.clone(),
-                    node.structure_path.clone(),
+                    node.first_structure_path().map(str::to_string),
                 )
             });
         let Some((sample_id, structure_path)) = row else {
@@ -1119,6 +1299,16 @@ impl App {
         &self.mesh_cache
     }
 
+    pub fn set_current_chain(&mut self, idx: usize) {
+        if idx >= self.protein.chains.len() || idx == self.current_chain {
+            return;
+        }
+        self.current_chain = idx;
+        if self.active_panel == ActivePanel::Interface {
+            self.rebuild_interface_colors();
+        }
+    }
+
     pub fn next_chain(&mut self) {
         if !self.protein.chains.is_empty() {
             self.current_chain = (self.current_chain + 1) % self.protein.chains.len();
@@ -1318,6 +1508,9 @@ impl App {
     /// Enter edit mode for an existing region (Enter key on a region).
     /// If there are no regions, delegates to `edit_region_add()` instead.
     pub fn edit_region_start(&mut self) {
+        if self.edit_state.editing && self.shell.mode != InteractionMode::EditRegion {
+            self.abandon_edit_form();
+        }
         if self.edit_state.editing {
             return;
         }
@@ -1344,12 +1537,17 @@ impl App {
             draft_label: region.label.clone().unwrap_or_default(),
             validation_error: None,
             delete_confirm: false,
+            overlap_replace_armed: false,
         };
+        self.shell.focus(PaneId::EditSpec);
         self.shell.enter_mode(InteractionMode::EditRegion);
     }
 
     /// Start adding a new region (a key in EditSpec panel).
     pub fn edit_region_add(&mut self) {
+        if self.edit_state.editing && self.shell.mode != InteractionMode::EditRegion {
+            self.abandon_edit_form();
+        }
         if self.edit_state.editing {
             return;
         }
@@ -1383,12 +1581,17 @@ impl App {
             draft_label: String::new(),
             validation_error: None,
             delete_confirm: false,
+            overlap_replace_armed: false,
         };
+        self.shell.focus(PaneId::EditSpec);
         self.shell.enter_mode(InteractionMode::EditRegion);
     }
 
     /// Enter opens an empty form, or a selection-prefilled form when a range is active.
     pub fn edit_region_open_empty(&mut self) {
+        if self.edit_state.editing && self.shell.mode != InteractionMode::EditRegion {
+            self.abandon_edit_form();
+        }
         if self.edit_state.editing {
             return;
         }
@@ -1400,6 +1603,9 @@ impl App {
     }
 
     pub fn edit_region_open_from_selection(&mut self) {
+        if self.edit_state.editing && self.shell.mode != InteractionMode::EditRegion {
+            self.abandon_edit_form();
+        }
         if self.edit_state.editing {
             return;
         }
@@ -1429,7 +1635,9 @@ impl App {
             draft_label: String::new(),
             validation_error: None,
             delete_confirm: false,
+            overlap_replace_armed: false,
         };
+        self.shell.focus(PaneId::EditSpec);
         self.shell.enter_mode(InteractionMode::EditRegion);
     }
 
@@ -1609,6 +1817,8 @@ impl App {
         if !self.edit_state.editing {
             return;
         }
+        self.edit_state.overlap_replace_armed = false;
+        self.edit_state.validation_error = None;
         match self.edit_state.cursor_field {
             EditField::Label if ch.is_alphanumeric() || ch == '-' || ch == '_' => {
                 if self.edit_state.draft_label.len() < 20 {
@@ -1629,6 +1839,8 @@ impl App {
         if !self.edit_state.editing {
             return;
         }
+        self.edit_state.overlap_replace_armed = false;
+        self.edit_state.validation_error = None;
         match self.edit_state.cursor_field {
             EditField::Label => {
                 self.edit_state.draft_label.pop();
@@ -1699,23 +1911,25 @@ impl App {
             return false;
         }
 
-        // Check overlap with existing regions (excluding the one being edited).
+        // Overlap is a warning, not a lock. First Enter arms replace; second replaces.
         let editing_idx = self.edit_state.editing_region_idx;
-        if let Some(ref ann) = self.annotation {
-            if let Some(ref regions) = ann.editspec_regions {
-                for (i, r) in regions.iter().enumerate() {
-                    if Some(i) == editing_idx {
-                        continue; // Skip the region being edited.
-                    }
-                    if r.chain == *chain && r.range[1] >= start && r.range[0] <= end {
-                        self.edit_state.validation_error = Some(format!(
-                            "Overlaps with region {} [{}-{}] on chain {}",
-                            i, r.range[0], r.range[1], r.chain
-                        ));
-                        return false;
-                    }
-                }
-            }
+        let overlap_idxs = self.overlapping_region_indices(chain, start, end, editing_idx);
+        if !overlap_idxs.is_empty() && !self.edit_state.overlap_replace_armed {
+            self.edit_state.overlap_replace_armed = true;
+            let i = overlap_idxs[0];
+            let r = self
+                .annotation
+                .as_ref()
+                .and_then(|a| a.editspec_regions.as_ref())
+                .and_then(|regions| regions.get(i));
+            self.edit_state.validation_error = Some(match r {
+                Some(r) => format!(
+                    "Overlaps region {} [{}-{}]. Change range, or Enter again to replace.",
+                    i, r.range[0], r.range[1]
+                ),
+                None => "Overlaps an existing region. Enter again to replace.".to_string(),
+            });
+            return false;
         }
 
         // Optionally validate via bridge if available.
@@ -1768,6 +1982,10 @@ impl App {
                 let errors: Vec<_> = issues
                     .iter()
                     .filter(|i| i.severity == "error")
+                    .filter(|i| {
+                        !(self.edit_state.overlap_replace_armed
+                            && i.message.to_ascii_lowercase().contains("overlap"))
+                    })
                     .collect();
                 if !errors.is_empty() {
                     self.edit_state.validation_error =
@@ -1810,12 +2028,27 @@ impl App {
                 ann.editspec_regions = Some(Vec::new());
             }
             if let Some(ref mut regions) = ann.editspec_regions {
-                match editing_idx {
+                let mut apply_idx = editing_idx;
+                if !overlap_idxs.is_empty() {
+                    let mut drop = overlap_idxs;
+                    drop.sort_unstable();
+                    drop.dedup();
+                    for o in drop.into_iter().rev() {
+                        if o < regions.len() {
+                            regions.remove(o);
+                        }
+                        if let Some(idx) = apply_idx {
+                            if o < idx {
+                                apply_idx = Some(idx - 1);
+                            }
+                        }
+                    }
+                }
+                match apply_idx {
                     Some(idx) if idx < regions.len() => {
                         regions[idx] = new_region;
                     }
                     _ => {
-                        // Adding new region.
                         regions.push(new_region);
                         self.focused_region = regions.len() - 1;
                     }
@@ -1864,7 +2097,19 @@ impl App {
             .unwrap_or(false);
 
         if has_overlap {
-            return Some(format!("Overlap: selection {}:{}-{} overlaps existing region", chain_id, seq_start, seq_end));
+            if self.pending_overlap_action.as_deref() != Some(action) {
+                self.pending_overlap_action = Some(action.to_string());
+                let msg = format!(
+                    "Overlaps existing region. Press {action} again to replace, or right-click → Replace overlapping."
+                );
+                self.status_banner = Some(msg.clone());
+                return Some(msg);
+            }
+            self.remove_overlapping_regions(&chain_id, seq_start, seq_end, exact_match);
+            self.pending_overlap_action = None;
+            self.status_banner = None;
+        } else {
+            self.pending_overlap_action = None;
         }
 
         self.push_history(&format!("action shortcut {}:{}-{} -> {}", chain_id, seq_start, seq_end, action));
@@ -1927,13 +2172,504 @@ impl App {
     }
 
     pub fn enter_select_mode(&mut self) {
+        self.abandon_edit_form();
+        self.shell.focus(PaneId::EditSpec);
         self.shell.enter_mode(InteractionMode::Select);
     }
 
-    pub fn enter_run_mode(&mut self) {
-        if self.shell.mode == InteractionMode::View {
-            self.shell.enter_mode(InteractionMode::Run);
+    pub fn abandon_edit_form(&mut self) {
+        self.edit_state = EditState::default();
+        if self.shell.mode == InteractionMode::EditRegion {
+            self.shell.enter_idle();
         }
+    }
+
+    fn overlapping_region_indices(
+        &self,
+        chain: &str,
+        start: usize,
+        end: usize,
+        except: Option<usize>,
+    ) -> Vec<usize> {
+        self.annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .map(|regions| {
+                regions
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, r)| {
+                        Some(*i) != except
+                            && r.chain == chain
+                            && r.range[1] >= start
+                            && r.range[0] <= end
+                    })
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove_overlapping_regions(
+        &mut self,
+        chain: &str,
+        start: usize,
+        end: usize,
+        except: Option<usize>,
+    ) {
+        let mut drop = self.overlapping_region_indices(chain, start, end, except);
+        drop.sort_unstable();
+        drop.dedup();
+        if let Some(regions) = self
+            .annotation
+            .as_mut()
+            .and_then(|a| a.editspec_regions.as_mut())
+        {
+            for i in drop.into_iter().rev() {
+                if i < regions.len() {
+                    regions.remove(i);
+                }
+            }
+        }
+        if let Some(len) = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .map(|r| r.len())
+        {
+            if len == 0 {
+                self.focused_region = 0;
+            } else if self.focused_region >= len {
+                self.focused_region = len - 1;
+            }
+        }
+    }
+
+    fn selection_seq_range(&self) -> Option<(String, usize, usize)> {
+        let (start, end) = self.seq_selection.range()?;
+        let chain = self.protein.chains.get(self.current_chain)?;
+        let seq_start = chain.residues.get(start)?.seq_num as usize;
+        let seq_end = chain.residues.get(end)?.seq_num as usize;
+        Some((chain.id.clone(), seq_start, seq_end))
+    }
+
+    fn selection_exact_region(&self) -> Option<usize> {
+        let (chain, start, end) = self.selection_seq_range()?;
+        self.annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())?
+            .iter()
+            .position(|r| r.chain == chain && r.range[0] == start && r.range[1] == end)
+    }
+
+    fn selection_has_overlap(&self) -> bool {
+        let Some((chain, start, end)) = self.selection_seq_range() else {
+            return false;
+        };
+        !self
+            .overlapping_region_indices(&chain, start, end, self.selection_exact_region())
+            .is_empty()
+    }
+
+    pub fn residue_indices_for_seq_range(
+        residues: &[crate::model::protein::Residue],
+        seq_start: usize,
+        seq_end: usize,
+    ) -> Option<(usize, usize)> {
+        let start = residues.iter().position(|r| (r.seq_num as usize) >= seq_start)?;
+        let end = residues.iter().rposition(|r| (r.seq_num as usize) <= seq_end)?;
+        if start <= end {
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    /// Region list and sequence share one selection. No sequence on this
+    /// structure is `undef`: list focus stays, highlight clears.
+    pub fn focus_region(&mut self, idx: usize, enter_select: bool) {
+        let Some(region) = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .and_then(|regions| regions.get(idx))
+            .cloned()
+        else {
+            return;
+        };
+        self.focused_region = idx;
+        self.abandon_edit_form();
+
+        let Some(chain_idx) = self
+            .protein
+            .chains
+            .iter()
+            .position(|c| c.id == region.chain)
+        else {
+            self.seq_selection.clear();
+            self.sync_selection_overlay();
+            self.status_banner = Some(format!(
+                "Region {idx} chain {} is undef on this structure",
+                region.chain
+            ));
+            return;
+        };
+        if chain_idx != self.current_chain {
+            self.current_chain = chain_idx;
+            if self.active_panel == ActivePanel::Interface {
+                self.rebuild_interface_colors();
+            }
+        }
+
+        let residues = self.current_residues();
+        match Self::residue_indices_for_seq_range(residues, region.range[0], region.range[1]) {
+            Some((start, end)) => {
+                let max = residues.len();
+                self.seq_selection.select_range(start, end, max);
+                self.ensure_seq_visible(start);
+                self.status_banner = None;
+                if enter_select {
+                    self.enter_select_mode();
+                }
+                self.sync_selection_overlay();
+            }
+            None => {
+                self.seq_selection.clear();
+                self.sync_selection_overlay();
+                self.status_banner = Some(format!(
+                    "Region {idx} {}:{}-{} is undef on this sequence",
+                    region.chain, region.range[0], region.range[1]
+                ));
+            }
+        }
+    }
+
+    pub fn ensure_seq_visible(&mut self, residue_idx: usize) {
+        let (start_row, per) = self
+            .seq_blocks
+            .iter()
+            .find(|b| b.chain_idx == self.current_chain)
+            .map(|b| (b.start_row, b.per_line.max(1)))
+            .unwrap_or((self.seq_line_row, self.seq_per_line.max(1)));
+        if start_row == u16::MAX {
+            return;
+        }
+        let row = start_row.saturating_add(((residue_idx / per) as u16).saturating_mul(3));
+        let view_h = self
+            .last_sidebar_rect
+            .map(|r| r.height.saturating_sub(2))
+            .unwrap_or(10);
+        if row < self.panel_scroll {
+            self.panel_scroll = row;
+        } else if row.saturating_add(3) > self.panel_scroll.saturating_add(view_h) {
+            self.panel_scroll = row.saturating_add(3).saturating_sub(view_h);
+        }
+    }
+
+    pub fn sync_focused_region_from_selection(&mut self) {
+        let Some((start, _)) = self.seq_selection.range() else {
+            return;
+        };
+        if let Some(idx) = self.region_index_covering_residue(start) {
+            self.focused_region = idx;
+        }
+    }
+
+    pub fn region_index_covering_residue(&self, residue_idx: usize) -> Option<usize> {
+        let chain = self.protein.chains.get(self.current_chain)?;
+        let seq_num = chain.residues.get(residue_idx)?.seq_num as usize;
+        self.annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())?
+            .iter()
+            .position(|r| r.chain == chain.id && r.range[0] <= seq_num && r.range[1] >= seq_num)
+    }
+
+    pub fn open_context_menu(&mut self, col: u16, row: u16, target: ContextTarget) {
+        self.abandon_edit_form();
+        self.shell.focus(PaneId::EditSpec);
+        if matches!(
+            self.shell.overlay,
+            Overlay::Help | Overlay::RunComposer | Overlay::RunStatus
+        ) {
+            return;
+        }
+        if self.shell.overlay == Overlay::ContextMenu {
+            self.shell.close_overlay();
+        }
+        let items = self.build_context_items(target);
+        let cursor = items.iter().position(|i| i.selectable()).unwrap_or(0);
+        self.context_menu = Some(ContextMenu {
+            col,
+            row,
+            cursor,
+            items,
+            target,
+            last_rect: Rect::default(),
+        });
+        self.shell.open_overlay(Overlay::ContextMenu);
+    }
+
+    fn build_context_items(&self, target: ContextTarget) -> Vec<ContextItem> {
+        let mut items = vec![ContextItem::Header("Action")];
+        for action in VALID_ACTIONS {
+            items.push(ContextItem::Action(action));
+        }
+        items.push(ContextItem::Header("Label"));
+        for label in PREDEFINED_LABELS {
+            items.push(ContextItem::Label(label));
+        }
+        match target {
+            ContextTarget::Region(_) => {
+                items.push(ContextItem::Header("Region"));
+                items.push(ContextItem::EditRange);
+                items.push(ContextItem::Delete);
+            }
+            ContextTarget::Selection => {
+                items.push(ContextItem::Header("Selection"));
+                items.push(ContextItem::EditRange);
+                if self.selection_has_overlap() {
+                    items.push(ContextItem::ReplaceOverlap);
+                }
+            }
+        }
+        items
+    }
+
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        if self.shell.overlay == Overlay::ContextMenu {
+            self.shell.close_overlay();
+        }
+    }
+
+    pub fn context_menu_move(&mut self, dir: i32) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let n = menu.items.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let mut i = menu.cursor as i32;
+        for _ in 0..n {
+            i = (i + dir).rem_euclid(n);
+            if menu.items[i as usize].selectable() {
+                menu.cursor = i as usize;
+                return;
+            }
+        }
+    }
+
+    pub fn apply_context_menu(&mut self) {
+        let Some(menu) = self.context_menu.clone() else {
+            return;
+        };
+        let item = menu.items.get(menu.cursor).cloned();
+        self.close_context_menu();
+        if let Some(item) = item {
+            self.apply_context_item(item, menu.target);
+        }
+    }
+
+    fn apply_context_item(&mut self, item: ContextItem, target: ContextTarget) {
+        match item {
+            ContextItem::Header(_) => {}
+            ContextItem::Action(name) => match target {
+                ContextTarget::Selection => {
+                    self.pending_overlap_action = Some(name.to_string());
+                    if let Some(msg) = self.apply_action_shortcut(name) {
+                        self.status_banner = Some(msg);
+                    }
+                    self.revalidate();
+                }
+                ContextTarget::Region(idx) => self.set_region_action(idx, name),
+            },
+            ContextItem::Label(name) => match target {
+                ContextTarget::Selection => self.apply_label_to_selection(name),
+                ContextTarget::Region(idx) => self.set_region_label(idx, name),
+            },
+            ContextItem::EditRange => match target {
+                ContextTarget::Region(idx) => {
+                    self.focused_region = idx;
+                    self.edit_region_start();
+                }
+                ContextTarget::Selection => {
+                    self.edit_region_open_from_selection();
+                }
+            },
+            ContextItem::Delete => {
+                if let ContextTarget::Region(idx) = target {
+                    self.focused_region = idx;
+                    self.delete_focused_region_now();
+                }
+            }
+            ContextItem::ReplaceOverlap => {
+                if let Some((chain, start, end)) = self.selection_seq_range() {
+                    self.push_history("replace overlapping regions");
+                    self.remove_overlapping_regions(&chain, start, end, None);
+                    self.pending_overlap_action = None;
+                    self.status_banner =
+                        Some("Overlapping regions removed. Pick an Action or Label.".to_string());
+                    self.revalidate();
+                }
+            }
+        }
+    }
+
+    fn set_region_action(&mut self, idx: usize, action: &str) {
+        let Some(regions) = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+        else {
+            return;
+        };
+        if idx >= regions.len() {
+            return;
+        }
+        self.push_history(&format!("set region {idx} action {action}"));
+        if let Some(region) = self
+            .annotation
+            .as_mut()
+            .and_then(|a| a.editspec_regions.as_mut())
+            .and_then(|r| r.get_mut(idx))
+        {
+            region.action = action.to_string();
+        }
+        self.status_banner = Some(format!("Region {idx} → {action}"));
+        self.revalidate();
+    }
+
+    fn set_region_label(&mut self, idx: usize, label: &str) {
+        let Some(regions) = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+        else {
+            return;
+        };
+        if idx >= regions.len() {
+            return;
+        }
+        self.push_history(&format!("set region {idx} label {label}"));
+        if let Some(region) = self
+            .annotation
+            .as_mut()
+            .and_then(|a| a.editspec_regions.as_mut())
+            .and_then(|r| r.get_mut(idx))
+        {
+            region.label = Some(label.to_string());
+        }
+        self.status_banner = Some(format!("Region {idx} label → {label}"));
+        self.revalidate();
+    }
+
+    fn apply_label_to_selection(&mut self, label: &str) {
+        let Some((chain, start, end)) = self.selection_seq_range() else {
+            return;
+        };
+        if self.selection_has_overlap() {
+            self.push_history(&format!("label {label} (replace overlap)"));
+            self.remove_overlapping_regions(&chain, start, end, self.selection_exact_region());
+        }
+        self.pending_overlap_action = None;
+        if self.apply_action_shortcut("edit").is_none() {
+            return;
+        }
+        if let Some(idx) = self
+            .annotation
+            .as_ref()
+            .and_then(|a| a.editspec_regions.as_ref())
+            .and_then(|regions| {
+                regions.iter().position(|r| {
+                    r.chain == chain && r.range[0] == start && r.range[1] == end
+                })
+            })
+        {
+            if let Some(region) = self
+                .annotation
+                .as_mut()
+                .and_then(|a| a.editspec_regions.as_mut())
+                .and_then(|r| r.get_mut(idx))
+            {
+                region.label = Some(label.to_string());
+            }
+            self.status_banner = Some(format!("Selection labeled {label}"));
+            self.revalidate();
+        }
+    }
+
+    fn delete_focused_region_now(&mut self) {
+        self.edit_state.delete_confirm = true;
+        let _ = self.edit_region_delete();
+        self.edit_state.delete_confirm = false;
+        self.status_banner = Some("Region deleted".to_string());
+    }
+
+    pub fn can_run(&self) -> bool {
+        self.python_available
+    }
+
+    pub fn enter_run_mode(&mut self) {
+        if self.shell.mode == InteractionMode::EditRegion {
+            return;
+        }
+        self.shell.open_overlay(Overlay::RunComposer);
+    }
+
+    pub fn toggle_help_overlay(&mut self) {
+        match self.shell.overlay {
+            Overlay::None => self.shell.open_overlay(Overlay::Help),
+            Overlay::Help => self.shell.close_overlay(),
+            Overlay::ContextMenu => {
+                self.close_context_menu();
+                self.shell.open_overlay(Overlay::Help);
+            }
+            Overlay::RunComposer | Overlay::RunStatus => {}
+        }
+    }
+
+    pub fn close_help_overlay(&mut self) {
+        if self.shell.overlay == Overlay::Help {
+            self.shell.close_overlay();
+        }
+    }
+
+    pub fn close_run_overlay(&mut self) {
+        if matches!(self.shell.overlay, Overlay::RunComposer | Overlay::RunStatus) {
+            self.shell.close_overlay();
+        }
+    }
+
+    /// Leave Select (keep range) or cancel EditRegion, then focus the clicked pane.
+    /// Click-away from a form must Idle the pane machine; do not restore Select.
+    pub fn apply_view_drag(&mut self, col: u16, row: u16) {
+        if let Some((last_col, last_row)) = self.view_drag_last {
+            let dx = col as i32 - last_col as i32;
+            let dy = row as i32 - last_row as i32;
+            if dx != 0 {
+                self.camera.rotate_y(dx as f64);
+            }
+            if dy != 0 {
+                self.camera.rotate_x(dy as f64);
+            }
+        }
+        self.view_drag_last = Some((col, row));
+    }
+
+    pub fn pointer_focus_pane(&mut self, pane: PaneId) {
+        if self.shell.overlay.is_open() {
+            return;
+        }
+        let leaving_form = self.shell.mode == InteractionMode::EditRegion && pane != PaneId::EditSpec;
+        if leaving_form {
+            self.edit_state = EditState::default();
+        }
+        if leaving_form || self.shell.mode != InteractionMode::EditRegion {
+            self.shell.pointer_leave_local_mode();
+        }
+        self.shell.focus(pane);
     }
 
     pub fn sync_selection_overlay(&mut self) {
@@ -2029,12 +2765,21 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_contiguous_segment() {
+    fn click_selects_that_residue_not_whole_ss_segment() {
         let residues = helix_sheet_residues();
         let mut sel = SeqSelection::default();
         sel.click(&residues, 2);
-        assert_eq!(sel.range(), Some((0, 4)));
+        assert_eq!(sel.range(), Some((2, 2)));
         assert!(sel.active);
+        assert_ne!(sel.range(), Some((0, 4)));
+    }
+
+    #[test]
+    fn select_segment_covers_contiguous_ss() {
+        let residues = helix_sheet_residues();
+        let mut sel = SeqSelection::default();
+        sel.select_segment(&residues, 2);
+        assert_eq!(sel.range(), Some((0, 4)));
     }
 
     #[test]
@@ -2043,7 +2788,29 @@ mod tests {
         let mut sel = SeqSelection::default();
         sel.click(&residues, 1);
         sel.drag_to(6, residues.len());
-        assert_eq!(sel.range(), Some((0, 6)));
+        assert_eq!(sel.range(), Some((1, 6)));
+    }
+
+    #[test]
+    fn select_range_covers_indices() {
+        let mut sel = SeqSelection::default();
+        sel.select_range(1, 6, 8);
+        assert_eq!(sel.range(), Some((1, 6)));
+        assert_eq!(sel.cursor, 1);
+    }
+
+    #[test]
+    fn seq_range_maps_to_residue_indices_or_undef() {
+        let residues = helix_sheet_residues();
+        assert_eq!(
+            App::residue_indices_for_seq_range(&residues, 1, 10),
+            Some((0, 7))
+        );
+        assert_eq!(
+            App::residue_indices_for_seq_range(&residues, 6, 8),
+            Some((5, 7))
+        );
+        assert_eq!(App::residue_indices_for_seq_range(&residues, 100, 110), None);
     }
 
     #[test]

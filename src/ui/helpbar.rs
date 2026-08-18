@@ -5,42 +5,78 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
-use crate::shell::InteractionMode;
+use crate::shell::{InteractionMode, Overlay};
 
 /// Render the keybinding hints bar at the bottom.
 pub fn render_helpbar(frame: &mut Frame, area: Rect, app: &App) {
-    let spans = match app.shell.mode {
-        InteractionMode::EditRegion => hint_line(&[
-            ("Tab", "field"),
-            ("type", "A51-80"),
-            ("Enter", "save"),
-            ("Esc", "back"),
+    if let Some(banner) = &app.status_banner {
+        let spans = vec![
+            Span::styled(
+                "\u{2570}\u{2500}\u{2500} ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                banner.clone(),
+                Style::default()
+                    .fg(Color::Rgb(255, 200, 0))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  ", Style::default().fg(Color::Gray)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+    let spans = match app.shell.overlay {
+        Overlay::Help => hint_line(&[("Esc/?", "close Help")]),
+        Overlay::RunComposer | Overlay::RunStatus => {
+            hint_line(&[("Esc", "close Run"), ("Ctrl+R", "ignored")])
+        }
+        Overlay::ContextMenu => hint_line(&[
+            ("j/k", "item"),
+            ("Enter", "apply"),
+            ("Esc", "close"),
         ]),
-        InteractionMode::Select => hint_line(&[
-            ("h/l", "cursor"),
-            ("H/L", "edge"),
-            ("s", "segment"),
-            ("[/]", "jump"),
-            ("1-5", "action"),
-            ("Esc", "View"),
-        ]),
-        InteractionMode::Run => hint_line(&[("Esc", "close Run"), ("Ctrl+R", "ignored")]),
-        InteractionMode::View if app.shell.editspec_focused() => hint_line(&[
-            ("j/k", "regions"),
-            ("x", "Select"),
-            ("Enter", "form"),
-            ("e", "edit"),
-            ("Tab", "pane"),
-            ("f", "fold"),
-        ]),
-        InteractionMode::View => hint_line(&[
-            ("h/l j/k", "rotate"),
-            ("x", "Select"),
-            ("Ctrl+R", "Run"),
-            ("Tab", "pane"),
-            ("f", "fold"),
-            ("q", "quit"),
-        ]),
+        Overlay::None => match app.shell.mode {
+            InteractionMode::EditRegion => hint_line(&[
+                ("Tab", "field"),
+                ("type", "A51-80"),
+                ("Enter", "save"),
+                ("Esc", "cancel"),
+            ]),
+            InteractionMode::Select => hint_line(&[
+                ("h/l", "cursor"),
+                ("H/L", "edge"),
+                ("s", "segment"),
+                ("[/]", "jump"),
+                ("1-5", "action"),
+                ("right", "menu"),
+                ("Esc", "clear"),
+                ("Tab", "pane"),
+            ]),
+            InteractionMode::Idle if app.shell.tree_focused() => hint_line(&[
+                ("j/k", "row"),
+                ("h/l", "fold"),
+                ("≡/◈", "seq/fold"),
+                ("Enter", "load"),
+                ("wheel", "scroll"),
+            ]),
+            InteractionMode::Idle if app.shell.editspec_focused() => hint_line(&[
+                ("j/k", "regions"),
+                ("x", "Select"),
+                ("Enter", "form"),
+                ("e", "edit"),
+                ("right", "menu"),
+                ("Tab", "pane"),
+                ("f", "fold"),
+            ]),
+            InteractionMode::Idle => hint_line(&[
+                ("Tab", "pane"),
+                ("f", "fold"),
+                ("drag", "size"),
+                ("Ctrl+R", "Run"),
+                ("q", "quit"),
+            ]),
+        },
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

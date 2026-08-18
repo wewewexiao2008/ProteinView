@@ -2,18 +2,176 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-use crate::app::{App, EditField, PREDEFINED_LABELS, VALID_ACTIONS, label_color};
+use crate::app::{
+    App, EditField, PREDEFINED_LABELS, SeqChainBlock, VALID_ACTIONS, label_color,
+};
 use crate::shell::PaneId;
 use crate::ui::chrome::pane_block;
 use crate::edit_history::IssueSeverity;
-use crate::model::protein::{MoleculeType, SecondaryStructure};
+use crate::model::protein::SecondaryStructure;
 
 /// Width of the EditSpec sidebar in columns (horizontal layout).
 /// Width of the EditSpec sidebar in columns (horizontal layout).
 #[allow(dead_code)]
 pub const SIDEBAR_WIDTH: u16 = 60;
+
+/// No letter/SS row this frame. 0 is a valid content index, so it is not absent.
+pub const ABSENT_SEQ_ROW: u16 = u16::MAX;
+
+/// Inner content of a bordered pane: last_sidebar_rect is outer chrome.
+pub fn sidebar_inner(outer: Rect) -> Rect {
+    Rect {
+        x: outer.x.saturating_add(1),
+        y: outer.y.saturating_add(1),
+        width: outer.width.saturating_sub(2),
+        height: outer.height.saturating_sub(2),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqHit {
+    Letter(usize),
+    SecondaryStructure(usize),
+    ActionMarker(usize),
+}
+
+/// Residues per group before a spacer.
+pub const SEQ_GROUP: usize = 5;
+pub const SEQ_LINE_NARROW: usize = 25;
+pub const SEQ_LINE_WIDE: usize = 50;
+pub const SEQ_PREFIX_COLS: usize = 5;
+pub const SEQ_BLOCK_ROWS: u16 = 3;
+
+pub fn residues_per_line(inner_width: u16) -> usize {
+    let w = inner_width as usize;
+    let need = |n: usize| SEQ_PREFIX_COLS + n + n.saturating_sub(1) / SEQ_GROUP;
+    if w >= need(SEQ_LINE_WIDE) {
+        SEQ_LINE_WIDE
+    } else {
+        SEQ_LINE_NARROW
+    }
+}
+
+/// Column of residue `offset` on a wrap line, including prefix and every-5 gaps.
+pub fn display_col_for_offset(offset: usize) -> usize {
+    SEQ_PREFIX_COLS + offset + offset / SEQ_GROUP
+}
+
+/// Map a content column to a residue offset on that wrap line.
+pub fn offset_at_display_col(col: usize, per_line: usize) -> Option<usize> {
+    if per_line == 0 {
+        return None;
+    }
+    if col < SEQ_PREFIX_COLS {
+        return Some(0);
+    }
+    let mut c = SEQ_PREFIX_COLS;
+    for o in 0..per_line {
+        if o > 0 && o % SEQ_GROUP == 0 {
+            if col == c {
+                return Some(o);
+            }
+            c += 1;
+        }
+        if col == c {
+            return Some(o);
+        }
+        c += 1;
+    }
+    None
+}
+
+/// Visual rows a paragraph line occupies at `width` (ratatui wrap).
+pub fn line_visual_rows(line: &Line<'_>, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let chars = line.width() as u16;
+    if chars == 0 {
+        return 1;
+    }
+    chars.div_ceil(width)
+}
+
+pub fn visual_rows_before(lines: &[Line<'_>], width: u16) -> u16 {
+    lines.iter().map(|line| line_visual_rows(line, width)).sum()
+}
+
+/// Hit-test wrapped sequence blocks. `seq_start_row` is the first letter row.
+pub fn hit_test_seq(
+    outer: Rect,
+    col: u16,
+    row: u16,
+    seq_start_row: u16,
+    per_line: usize,
+    wrap_lines: usize,
+    panel_scroll: u16,
+    residue_count: usize,
+) -> Option<SeqHit> {
+    let inner = sidebar_inner(outer);
+    if col < inner.x
+        || col >= inner.x.saturating_add(inner.width)
+        || row < inner.y
+        || row >= inner.y.saturating_add(inner.height)
+    {
+        return None;
+    }
+    if seq_start_row == ABSENT_SEQ_ROW || per_line == 0 || wrap_lines == 0 {
+        return None;
+    }
+    let content_row = row.saturating_sub(inner.y).saturating_add(panel_scroll);
+    if content_row < seq_start_row {
+        return None;
+    }
+    let rel = content_row.saturating_sub(seq_start_row);
+    let line = (rel / SEQ_BLOCK_ROWS) as usize;
+    let row_in = rel % SEQ_BLOCK_ROWS;
+    if line >= wrap_lines {
+        return None;
+    }
+    let col_in = col.saturating_sub(inner.x) as usize;
+    let offset = offset_at_display_col(col_in, per_line)?;
+    let idx = line.saturating_mul(per_line).saturating_add(offset);
+    if idx >= residue_count {
+        return None;
+    }
+    match row_in {
+        0 => Some(SeqHit::Letter(idx)),
+        1 => Some(SeqHit::SecondaryStructure(idx)),
+        _ => Some(SeqHit::ActionMarker(idx)),
+    }
+}
+
+/// Hit-test every chain block. Last inner column is the scrollbar and is ignored.
+pub fn hit_test_sequences(
+    outer: Rect,
+    col: u16,
+    row: u16,
+    blocks: &[SeqChainBlock],
+    panel_scroll: u16,
+) -> Option<(usize, SeqHit)> {
+    let inner = sidebar_inner(outer);
+    if inner.width > 0 && col + 1 >= inner.x.saturating_add(inner.width) {
+        return None;
+    }
+    for block in blocks {
+        if let Some(hit) = hit_test_seq(
+            outer,
+            col,
+            row,
+            block.start_row,
+            block.per_line,
+            block.wrap_lines,
+            panel_scroll,
+            block.residue_count,
+        ) {
+            return Some((block.chain_idx, hit));
+        }
+    }
+    None
+}
 
 /// Return the display color for a given editspec action string.
 fn action_color(action: &str) -> Color {
@@ -110,6 +268,112 @@ fn build_action_set(
         }
     }
     map
+}
+
+fn letter_style(base_fg: Color, selected: bool, cursor: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(base_fg)
+            .add_modifier(Modifier::BOLD)
+    } else if cursor {
+        Style::default()
+            .fg(base_fg)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(base_fg)
+    }
+}
+
+fn push_wrapped_sequence(
+    lines: &mut Vec<Line<'_>>,
+    app: &App,
+    residues: &[crate::model::protein::Residue],
+    chain_id: &str,
+    inner_width: u16,
+    highlight: bool,
+) -> SeqChainBlock {
+    let per = residues_per_line(inner_width);
+    let wrap_lines = residues.len().div_ceil(per);
+    let start_row = lines.len() as u16;
+
+    let action_map = build_action_set(&app.annotation, chain_id);
+    let sel_range = if highlight {
+        app.seq_selection.range()
+    } else {
+        None
+    };
+    let cursor_idx = if highlight {
+        Some(app.seq_selection.cursor)
+    } else {
+        None
+    };
+
+    for line_i in 0..wrap_lines {
+        let start = line_i * per;
+        let end = (start + per).min(residues.len());
+        let prefix = format!("{:>4} ", residues[start].seq_num);
+
+        let mut seq_spans = vec![Span::styled(
+            prefix.clone(),
+            Style::default().fg(Color::DarkGray),
+        )];
+        let mut ss_spans = vec![Span::raw(" ".repeat(SEQ_PREFIX_COLS))];
+        let mut act_spans = vec![Span::raw(" ".repeat(SEQ_PREFIX_COLS))];
+
+        for (j, residue) in residues[start..end].iter().enumerate() {
+            if j > 0 && j % SEQ_GROUP == 0 {
+                seq_spans.push(Span::raw(" "));
+                ss_spans.push(Span::raw(" "));
+                act_spans.push(Span::raw(" "));
+            }
+            let i = start + j;
+            let action = action_map.get(&residue.seq_num);
+            let base_fg = match action.map(|s| s.as_str()).unwrap_or("") {
+                "keep" => Color::Rgb(0, 200, 80),
+                "edit" => Color::Rgb(255, 200, 0),
+                "replace" => Color::Rgb(255, 80, 80),
+                "insert" => Color::Rgb(80, 150, 255),
+                "delete" => Color::Rgb(140, 140, 140),
+                _ => Color::White,
+            };
+            let selected = sel_range.map(|(s, e)| i >= s && i <= e).unwrap_or(false);
+            seq_spans.push(Span::styled(
+                aa_one_letter(&residue.name).to_string(),
+                letter_style(base_fg, selected, cursor_idx == Some(i)),
+            ));
+
+            let ss_color = match residue.secondary_structure {
+                SecondaryStructure::Helix => Color::Rgb(255, 100, 100),
+                SecondaryStructure::Sheet => Color::Rgb(100, 180, 255),
+                SecondaryStructure::Turn => Color::Rgb(200, 150, 255),
+                SecondaryStructure::Coil => Color::Rgb(80, 80, 80),
+            };
+            ss_spans.push(Span::styled(
+                ss_char(residue.secondary_structure).to_string(),
+                Style::default().fg(ss_color),
+            ));
+
+            match action {
+                Some(a) => act_spans.push(Span::styled(
+                    action_symbol(a).to_string(),
+                    Style::default().fg(action_color(a)),
+                )),
+                None => act_spans.push(Span::raw(" ")),
+            }
+        }
+        lines.push(Line::from(seq_spans));
+        lines.push(Line::from(ss_spans));
+        lines.push(Line::from(act_spans));
+    }
+
+    SeqChainBlock {
+        chain_idx: 0,
+        start_row,
+        per_line: per,
+        wrap_lines,
+        residue_count: residues.len(),
+    }
 }
 
 /// Render a field label with cursor indicator.
@@ -285,24 +549,34 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     // ========================================================================
     // Section 1: Chain Info (compact, ~2-3 lines)
     // ========================================================================
-    if let Some(chain) = app.protein.chains.get(app.current_chain) {
-        let res_count = chain.residues.len();
-        let atom_count: usize = chain.residues.iter().map(|r| r.atoms.len()).sum();
-
-        // Chain info on a single line
-        let mut chain_spans = vec![
-            Span::styled(" Chain ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("[{}]", chain.id),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {} res  {} atoms", res_count, atom_count),
-                Style::default().fg(Color::White),
-            ),
-        ];
+    if app.protein.chains.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No chains loaded",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let mut chain_spans = vec![Span::styled(
+            " Chains ",
+            Style::default().fg(Color::DarkGray),
+        )];
+        for (i, chain) in app.protein.chains.iter().enumerate() {
+            let label = format!("[{} {}]", chain.id, chain.residues.len());
+            if i == app.current_chain {
+                chain_spans.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                chain_spans.push(Span::styled(
+                    label,
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            chain_spans.push(Span::raw(" "));
+        }
 
         // Ligand info
         if !app.protein.ligands.is_empty() {
@@ -321,11 +595,6 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         }
 
         lines.push(Line::from(chain_spans));
-    } else {
-        lines.push(Line::from(Span::styled(
-            " No chains loaded",
-            Style::default().fg(Color::DarkGray),
-        )));
     }
 
     lines.push(Line::from(""));
@@ -530,210 +799,81 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // ========================================================================
-    // Section 3: Sequence (compact, ~3-4 lines)
+    // Section 3: Sequence (all chains, wrapped 25/50)
     // ========================================================================
+    let inner_width = area.width.saturating_sub(3).max(1);
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " \u{2500}\u{2500} Sequence\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-
-    // Sequence section
-    let chain = app.protein.chains.get(app.current_chain);
-    let _seq_header_lines = lines.len() as u16;
-
-    if let Some(c) = chain {
-        if c.molecule_type == MoleculeType::Protein {
-            let chain_id = &c.id;
-            let residues = &c.residues;
-            let res_count = residues.len();
-
-            if res_count > 0 {
-                let action_map = build_action_set(&app.annotation, chain_id);
-
-                // Compute available content width
-                let content_width = area.width.saturating_sub(2) as usize;
-                if content_width > 0 {
-                    let residues_per_line = content_width;
-
-                    // Apply horizontal scroll offset
-                    let h_scroll = app.seq_h_scroll as usize;
-                    let start_res = h_scroll;
-                    let end_res = (start_res + residues_per_line).min(res_count);
-
-                    // Track the sequence line row for mouse hit-testing
-                    app.seq_line_row = (lines.len() as u16).saturating_sub(app.panel_scroll);
-
-                    if start_res < res_count {
-                        // Get selection range for highlighting
-                        let sel_range = app.seq_selection.range();
-                        let cursor_idx = app.seq_selection.cursor;
-
-                        // Sequence line with action coloring + selection/cursor highlighting
-                        let mut seq_spans: Vec<Span> = Vec::new();
-                        for (i, residue) in residues.iter().enumerate() {
-                            if i < start_res || i >= end_res {
-                                continue;
-                            }
-                            let letter = aa_one_letter(&residue.name);
-
-                            // Determine action color
-                            let action = action_map.get(&residue.seq_num);
-                            let base_fg = match action.map(|s| s.as_str()).unwrap_or("") {
-                                "keep" => Color::Rgb(0, 200, 80),
-                                "edit" => Color::Rgb(255, 200, 0),
-                                "replace" => Color::Rgb(255, 80, 80),
-                                "insert" => Color::Rgb(80, 150, 255),
-                                "delete" => Color::Rgb(140, 140, 140),
-                                _ => Color::White,
-                            };
-
-                            // Check if this residue is selected
-                            let is_selected = sel_range
-                                .map(|(s, e)| i >= s && i <= e)
-                                .unwrap_or(false);
-                            let is_cursor = i == cursor_idx;
-
-                            if is_selected {
-                                // Selected: reverse video (colored background)
-                                seq_spans.push(Span::styled(
-                                    letter.to_string(),
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(base_fg)
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                            } else if is_cursor {
-                                // Cursor only (not selected): underline
-                                seq_spans.push(Span::styled(
-                                    letter.to_string(),
-                                    Style::default()
-                                        .fg(base_fg)
-                                        .add_modifier(Modifier::UNDERLINED),
-                                ));
-                            } else {
-                                seq_spans.push(Span::styled(
-                                    letter.to_string(),
-                                    Style::default().fg(base_fg),
-                                ));
-                            }
-                        }
-                        if !seq_spans.is_empty() {
-                            lines.push(Line::from(seq_spans));
-                        }
-
-                        // Secondary structure line
-                        let mut ss_spans: Vec<Span> = Vec::new();
-                        for (i, residue) in residues.iter().enumerate() {
-                            if i < start_res || i >= end_res {
-                                continue;
-                            }
-                            let ch = ss_char(residue.secondary_structure);
-                            let color = match residue.secondary_structure {
-                                SecondaryStructure::Helix => Color::Rgb(255, 100, 100),
-                                SecondaryStructure::Sheet => Color::Rgb(100, 180, 255),
-                                SecondaryStructure::Turn => Color::Rgb(200, 150, 255),
-                                SecondaryStructure::Coil => Color::Rgb(80, 80, 80),
-                            };
-                            ss_spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-                        }
-                        if !ss_spans.is_empty() {
-                            lines.push(Line::from(ss_spans));
-                        }
-
-                        // Action markers line
-                        let mut act_spans: Vec<Span> = Vec::new();
-                        for (i, residue) in residues.iter().enumerate() {
-                            if i < start_res || i >= end_res {
-                                continue;
-                            }
-                            let action = action_map.get(&residue.seq_num);
-                            match action {
-                                Some(a) => {
-                                    let sym = action_symbol(a);
-                                    let color = action_color(a);
-                                    act_spans.push(Span::styled(
-                                        sym.to_string(),
-                                        Style::default().fg(color),
-                                    ));
-                                }
-                                None => {
-                                    act_spans.push(Span::raw(" "));
-                                }
-                            }
-                        }
-                        if !act_spans.is_empty() {
-                            lines.push(Line::from(act_spans));
-                        }
-
-                        // Selection info and scroll hint
-                        let sel_info = if let Some((s, e)) = sel_range {
-                            let seq_start = residues[s].seq_num;
-                            let seq_end = residues[e].seq_num;
-                            format!(" sel:{}:{}-{} ", chain_id, seq_start, seq_end)
-                        } else {
-                            String::new()
-                        };
-
-                        if res_count > residues_per_line {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    sel_info,
-                                    Style::default()
-                                        .fg(Color::Cyan)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    format!(
-                                        " [{}/{}] h/l:nav H/L:sel 1-5:act y/Y:copy",
-                                        start_res + 1,
-                                        res_count
-                                    ),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                            ]));
-                        } else if !sel_info.is_empty() {
-                            lines.push(Line::from(vec![
-                                Span::styled(
-                                    sel_info,
-                                    Style::default()
-                                        .fg(Color::Cyan)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    " h/l:nav H/L:sel 1-5:act y/Y:copy",
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                            ]));
-                        }
-                    } else {
-                        app.seq_line_row = 0;
-                        lines.push(Line::from(Span::styled(
-                            " Scroll back with h",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
-            } else {
-                app.seq_line_row = 0;
-                lines.push(Line::from(Span::styled(
-                    " No residues",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        } else {
-            app.seq_line_row = 0;
-            lines.push(Line::from(Span::styled(
-                " Not a protein chain",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    } else {
-        app.seq_line_row = 0;
+    {
+        let per = residues_per_line(inner_width);
+        let title: String = format!(" \u{2500}\u{2500} Sequence {per}/line")
+            .chars()
+            .chain(std::iter::repeat('\u{2500}'))
+            .take(inner_width as usize)
+            .collect();
         lines.push(Line::from(Span::styled(
-            " No chain selected",
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    app.seq_blocks.clear();
+    app.seq_wrap_lines = 0;
+    let chain_snapshot: Vec<(usize, String, Vec<crate::model::protein::Residue>)> = app
+        .protein
+        .chains
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.residues.is_empty())
+        .map(|(i, c)| (i, c.id.clone(), c.residues.clone()))
+        .collect();
+    if chain_snapshot.is_empty() {
+        app.seq_line_row = ABSENT_SEQ_ROW;
+        app.ss_line_row = ABSENT_SEQ_ROW;
+        lines.push(Line::from(Span::styled(
+            " No residues",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (chain_idx, chain_id, residues) in &chain_snapshot {
+            let active = *chain_idx == app.current_chain;
+            let header_style = if active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(Span::styled(
+                format!(" Chain {chain_id}  {} res", residues.len()),
+                header_style,
+            )));
+            let mut block = push_wrapped_sequence(
+                &mut lines,
+                app,
+                residues,
+                chain_id,
+                inner_width,
+                active,
+            );
+            block.chain_idx = *chain_idx;
+            if app.seq_blocks.is_empty() {
+                app.seq_per_line = block.per_line;
+                app.seq_line_row = block.start_row;
+                app.ss_line_row = block.start_row.saturating_add(1);
+            }
+            app.seq_wrap_lines = app.seq_wrap_lines.saturating_add(block.wrap_lines);
+            app.seq_blocks.push(block);
+        }
+        let keys = if app.shell.mode == crate::shell::InteractionMode::Select {
+            " wheel:scroll  drag:select  all chains"
+        } else {
+            " wheel:scroll  all chains"
+        };
+        lines.push(Line::from(Span::styled(
+            keys,
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -791,11 +931,200 @@ pub fn render_editspec_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     app.panel_click_header = region_header_lines;
     app.panel_item_count = item_count;
+    app.panel_content_lines = lines.len() as u16;
 
+    // No wrap: one Line is one row. Hit-test and panel_scroll share this axis.
     let panel = Paragraph::new(lines)
         .block(pane_block(&app.shell, PaneId::EditSpec))
-        .scroll((app.panel_scroll, 0))
-        .wrap(Wrap { trim: false });
+        .scroll((app.panel_scroll, 0));
 
     frame.render_widget(panel, area);
+
+    let view_h = area.height.saturating_sub(2);
+    if app.panel_content_lines > view_h && area.width > 2 && area.height > 2 {
+        let bar_area = Rect {
+            x: area.x.saturating_add(area.width.saturating_sub(1)),
+            y: area.y.saturating_add(1),
+            width: 1,
+            height: view_h,
+        };
+        let mut state = ScrollbarState::new(app.panel_content_lines as usize)
+            .position(app.panel_scroll as usize)
+            .viewport_content_length(view_h as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼")),
+            bar_area,
+            &mut state,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residues_per_line_picks_25_or_50() {
+        assert_eq!(residues_per_line(40), SEQ_LINE_NARROW);
+        assert_eq!(residues_per_line(64), SEQ_LINE_WIDE);
+    }
+
+    #[test]
+    fn display_col_inserts_gap_every_five() {
+        assert_eq!(display_col_for_offset(0), SEQ_PREFIX_COLS);
+        assert_eq!(display_col_for_offset(4), SEQ_PREFIX_COLS + 4);
+        assert_eq!(display_col_for_offset(5), SEQ_PREFIX_COLS + 6);
+        assert_eq!(offset_at_display_col(SEQ_PREFIX_COLS + 5, 25), Some(5));
+        assert_eq!(offset_at_display_col(SEQ_PREFIX_COLS + 6, 25), Some(5));
+    }
+
+    #[test]
+    fn letter_line_hit_skips_prefix_and_border() {
+        let outer = Rect::new(10, 5, 40, 16);
+        let seq_row = 2u16;
+        let inner = sidebar_inner(outer);
+        assert_eq!(
+            hit_test_seq(outer, outer.x, inner.y + seq_row, seq_row, 25, 1, 0, 40),
+            None
+        );
+        assert_eq!(
+            hit_test_seq(outer, inner.x, inner.y + seq_row, seq_row, 25, 1, 0, 40),
+            Some(SeqHit::Letter(0))
+        );
+        assert_eq!(
+            hit_test_seq(
+                outer,
+                inner.x + SEQ_PREFIX_COLS as u16 + 2,
+                inner.y + seq_row,
+                seq_row,
+                25,
+                1,
+                0,
+                40
+            ),
+            Some(SeqHit::Letter(2))
+        );
+        assert_eq!(
+            hit_test_seq(outer, inner.x, inner.y + 1, seq_row, 25, 1, 0, 40),
+            None
+        );
+    }
+
+    #[test]
+    fn scroll_maps_visible_row_to_later_wrap_line() {
+        let outer = Rect::new(10, 5, 40, 16);
+        let inner = sidebar_inner(outer);
+        let seq_row = 2u16;
+        let scroll = 5u16;
+        let hit = hit_test_seq(
+            outer,
+            inner.x + SEQ_PREFIX_COLS as u16,
+            inner.y,
+            seq_row,
+            25,
+            4,
+            scroll,
+            80,
+        );
+        assert_eq!(hit, Some(SeqHit::Letter(25)));
+    }
+
+    #[test]
+    fn wrap_line_two_is_residue_25() {
+        let outer = Rect::new(10, 5, 40, 20);
+        let inner = sidebar_inner(outer);
+        let seq_row = 2u16;
+        let hit = hit_test_seq(
+            outer,
+            inner.x + SEQ_PREFIX_COLS as u16,
+            inner.y + seq_row + SEQ_BLOCK_ROWS,
+            seq_row,
+            25,
+            3,
+            0,
+            80,
+        );
+        assert_eq!(hit, Some(SeqHit::Letter(25)));
+    }
+
+    #[test]
+    fn visual_rows_count_wrapped_header() {
+        let wide = Line::from("─".repeat(40));
+        assert_eq!(line_visual_rows(&wide, 20), 2);
+        assert_eq!(visual_rows_before(&[wide, Line::from("")], 20), 3);
+    }
+
+    #[test]
+    fn ss_line_hit_selects_segment_index() {
+        let outer = Rect::new(10, 5, 40, 16);
+        let inner = sidebar_inner(outer);
+        let hit = hit_test_seq(
+            outer,
+            inner.x + SEQ_PREFIX_COLS as u16 + 1,
+            inner.y + 3,
+            2,
+            25,
+            1,
+            0,
+            40,
+        );
+        assert_eq!(hit, Some(SeqHit::SecondaryStructure(1)));
+    }
+
+    #[test]
+    fn action_marker_line_keeps_residue_for_drag() {
+        let outer = Rect::new(10, 5, 40, 16);
+        let inner = sidebar_inner(outer);
+        let hit = hit_test_seq(
+            outer,
+            inner.x + SEQ_PREFIX_COLS as u16,
+            inner.y + 4,
+            2,
+            25,
+            1,
+            0,
+            40,
+        );
+        assert_eq!(hit, Some(SeqHit::ActionMarker(0)));
+    }
+
+    #[test]
+    fn hit_test_sequences_picks_second_chain() {
+        let outer = Rect::new(10, 5, 40, 24);
+        let inner = sidebar_inner(outer);
+        let blocks = [
+            SeqChainBlock {
+                chain_idx: 0,
+                start_row: 2,
+                per_line: 25,
+                wrap_lines: 1,
+                residue_count: 10,
+            },
+            SeqChainBlock {
+                chain_idx: 1,
+                start_row: 6,
+                per_line: 25,
+                wrap_lines: 1,
+                residue_count: 10,
+            },
+        ];
+        let hit = hit_test_sequences(
+            outer,
+            inner.x + SEQ_PREFIX_COLS as u16,
+            inner.y + 6,
+            &blocks,
+            0,
+        );
+        assert_eq!(hit, Some((1, SeqHit::Letter(0))));
+    }
+
+    #[test]
+    fn absent_seq_rows_do_not_hit_header_as_letter() {
+        let outer = Rect::new(10, 5, 40, 16);
+        let inner = sidebar_inner(outer);
+        let hit = hit_test_seq(outer, inner.x, inner.y, ABSENT_SEQ_ROW, 25, 1, 0, 8);
+        assert_eq!(hit, None);
+    }
 }

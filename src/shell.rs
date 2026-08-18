@@ -1,8 +1,8 @@
 //! Studio four-pane chrome and exclusive-focus key router.
 //!
 //! ProteinView is the 3D engine; this module is the Studio session chrome:
-//! Workflow | Tree | View | EditSpec, plus one interaction-mode router
-//! (View | Select | EditRegion | Run). Workflow stays an empty shell.
+//! Overlay (Help | RunComposer | RunStatus) → EditSpec Select/EditRegion →
+//! focused-pane Idle → session chrome. Workflow stays an empty shell.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -43,22 +43,38 @@ impl PaneId {
     }
 }
 
-/// Interaction modes owned by the single key router.
+/// Session overlay. Depth is 0 or 1; Help, Composer, and ContextMenu never stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Help,
+    RunComposer,
+    #[allow(dead_code)]
+    RunStatus,
+    ContextMenu,
+}
+
+impl Overlay {
+    pub fn is_open(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// Pane-local mode. Idle means no Select/EditRegion on the focused pane.
+/// Session idle is overlay None AND this Idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
-    View,
+    Idle,
     Select,
     EditRegion,
-    Run,
 }
 
 impl InteractionMode {
     pub fn name(self) -> &'static str {
         match self {
-            Self::View => "View",
+            Self::Idle => "Idle",
             Self::Select => "Select",
             Self::EditRegion => "EditRegion",
-            Self::Run => "Run",
         }
     }
 }
@@ -74,8 +90,10 @@ pub enum KeyAction {
     EnterRun,
     OpenEmptyForm,
     EditFocusedRegion,
-    RestorePreviousMode,
+    ExitSelectKeepThenCycleNext,
+    ExitSelectKeepThenCyclePrev,
     ClearSelection,
+    CloseOverlay,
     CloseHelp,
     ToggleHelp,
     RotateX(f64),
@@ -119,6 +137,10 @@ pub enum KeyAction {
     EditFormCancel,
     EditFormBackspace,
     EditFormChar(char),
+    ContextMenuPrev,
+    ContextMenuNext,
+    ContextMenuApply,
+    CloseContextMenu,
     RunIgnore,
     TreeNext,
     TreePrev,
@@ -128,13 +150,19 @@ pub enum KeyAction {
     Ignore,
 }
 
-/// Exclusive-focus chrome: four panes, one mode.
+/// Exclusive-focus chrome: four panes, one pane mode, one overlay.
 #[derive(Debug, Clone)]
 pub struct Shell {
     pub focused: PaneId,
     pub expanded: [bool; 4],
     pub mode: InteractionMode,
     pub previous_mode: InteractionMode,
+    pub overlay: Overlay,
+    pub workflow_h: u16,
+    pub tree_w: u16,
+    pub editspec_w: u16,
+    pub tree_h: u16,
+    pub editspec_h: u16,
 }
 
 impl Default for Shell {
@@ -149,8 +177,14 @@ impl Shell {
         Self {
             focused: PaneId::View,
             expanded: [false, false, true, true],
-            mode: InteractionMode::View,
-            previous_mode: InteractionMode::View,
+            mode: InteractionMode::Idle,
+            previous_mode: InteractionMode::Idle,
+            overlay: Overlay::None,
+            workflow_h: 6,
+            tree_w: 22,
+            editspec_w: 48,
+            tree_h: 8,
+            editspec_h: 14,
         }
     }
 
@@ -159,8 +193,14 @@ impl Shell {
         Self {
             focused: PaneId::Tree,
             expanded: [false, true, true, true],
-            mode: InteractionMode::View,
-            previous_mode: InteractionMode::View,
+            mode: InteractionMode::Idle,
+            previous_mode: InteractionMode::Idle,
+            overlay: Overlay::None,
+            workflow_h: 6,
+            tree_w: 22,
+            editspec_w: 48,
+            tree_h: 8,
+            editspec_h: 14,
         }
     }
 
@@ -168,13 +208,16 @@ impl Shell {
         self.expanded[pane_index(pane)]
     }
 
-    #[allow(dead_code)]
     pub fn set_expanded(&mut self, pane: PaneId, expanded: bool) {
         self.expanded[pane_index(pane)] = expanded;
     }
 
     pub fn toggle_collapse(&mut self) {
-        let idx = pane_index(self.focused);
+        self.toggle_pane(self.focused);
+    }
+
+    pub fn toggle_pane(&mut self, pane: PaneId) {
+        let idx = pane_index(pane);
         self.expanded[idx] = !self.expanded[idx];
     }
 
@@ -199,12 +242,52 @@ impl Shell {
 
     pub fn restore_previous_mode(&mut self) {
         let previous = self.previous_mode;
-        self.mode = if previous == InteractionMode::EditRegion || previous == InteractionMode::Run {
-            InteractionMode::View
+        self.mode = if previous == InteractionMode::EditRegion {
+            InteractionMode::Idle
         } else {
             previous
         };
-        self.previous_mode = InteractionMode::View;
+        self.previous_mode = InteractionMode::Idle;
+    }
+
+    pub fn enter_idle(&mut self) {
+        self.mode = InteractionMode::Idle;
+        self.previous_mode = InteractionMode::Idle;
+    }
+
+    pub fn session_idle(&self) -> bool {
+        self.overlay == Overlay::None && self.mode == InteractionMode::Idle
+    }
+
+    pub fn open_overlay(&mut self, overlay: Overlay) {
+        if self.overlay == Overlay::None && overlay != Overlay::None {
+            self.overlay = overlay;
+        }
+    }
+
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    /// Leave Select without clearing the residue range, then cycle panes.
+    pub fn exit_select_keep_then_cycle(&mut self, next: bool) {
+        if self.mode == InteractionMode::Select {
+            self.enter_idle();
+        }
+        if next {
+            self.cycle_focus_next();
+        } else {
+            self.cycle_focus_prev();
+        }
+    }
+
+    /// Click another pane: Select / EditRegion → Idle (keep residue range).
+    /// Form widget teardown is the caller's job; this must not restore Select.
+    pub fn pointer_leave_local_mode(&mut self) {
+        match self.mode {
+            InteractionMode::Select | InteractionMode::EditRegion => self.enter_idle(),
+            InteractionMode::Idle => {}
+        }
     }
 
     pub fn editspec_focused(&self) -> bool {
@@ -229,50 +312,72 @@ fn pane_index(pane: PaneId) -> usize {
     }
 }
 
-/// Documented key table (pane switch + View/Select/EditRegion/Run).
+/// Documented key table (overlay → pane mode → idle → session chrome).
 pub const KEY_TABLE: &[(&str, &str)] = &[
-    ("Tab / Shift+Tab", "Cycle exclusive pane focus (Workflow | Tree | View | EditSpec)"),
-    ("f", "Collapse / expand the focused pane to a title strip"),
-    ("q", "Quit (View mode only)"),
-    ("h/l j/k w/a/s/d u/i [ ] v", "3D camera / viz (View mode; j/k rotate only when View is focused)"),
-    ("x", "Enter Select (sequence-selection contract)"),
-    ("Enter", "Tree: load the row's structure in View; otherwise open EditRegion form"),
+    ("Tab / Shift+Tab", "Idle: cycle panes. Select: Idle (keep selection) then cycle. EditRegion: form field. Overlay: freeze"),
+    ("f", "Collapse / expand the focused pane (idle only); click ▾/▸ does the same for that pane"),
+    ("Mouse: ▾ / border", "Click a pane's top-right badge to fold it. Drag a shared border to resize"),
+    ("q / Ctrl+C", "Quit only when idle (no overlay / form)"),
+    ("?", "Help overlay; exclusive with Composer"),
+    ("Ctrl+R", "Open Run Composer from any pane including Select; Ignore if Composer/Status or EditRegion is open"),
+    ("h/l j/k w/a/s/d u/i [ ] v", "3D camera / viz (View pane Idle only; j/k rotate only when View is focused)"),
+    ("x", "Enter Select (EditSpec Idle only)"),
+    ("Enter", "EditSpec Idle: empty form (or prefilled if a selection remains). Tree: load structure. Workflow / View: Ignore. Select: operate on the range"),
+    ("e", "Edit the focused existing region (EditSpec only)"),
     ("Tree: j/k h/l Enter", "Move / collapse / expand / load structure_path into View"),
-    ("e", "Edit the focused existing region"),
-    ("Ctrl+R", "Open Run overlay (View mode only; ignored in other modes)"),
+    ("Tree mouse", "▾/▸ toggles children only. Label selects; loads View only when structure_path exists. Wheel scrolls. One Line = one row"),
     ("Select: h/l H/L s [ ] 1-5", "Sequence cursor / boundary / segment / action shortcuts"),
-    ("Select: Esc", "Return to View (selection remains until a second Esc)"),
-    ("EditRegion: form keys", "Type range (A51-80 / A:51-80 / 51-80); 3D keys disabled; Esc restores previous mode"),
-    ("Run: Esc", "Close overlay; Ctrl+R does not stack"),
+    ("Right-click", "Selection or existing region: Action / Label menu"),
+    ("Select: Esc", "Clear selection and return EditSpec Idle (one Esc)"),
+    ("Select: Tab", "Idle (keep selection) then cycle pane"),
+    ("EditRegion: form keys", "Type range (A51-80 / A:51-80 / 51-80); Tab is a field; Esc cancels"),
+    ("Run Composer: Esc", "Close overlay; Ctrl+R does not stack"),
 ];
 
-/// Single key router. Callers must not run parallel `handle_*_key` stealers in View.
-pub fn route_key(shell: &Shell, key: KeyEvent, show_help: bool, has_selection: bool) -> KeyAction {
+/// Single key router. Priority: overlay → EditRegion → Select → pane Idle → chrome.
+pub fn route_key(shell: &Shell, key: KeyEvent, has_selection: bool, can_run: bool) -> KeyAction {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if show_help {
-        return match key.code {
-            KeyCode::Esc | KeyCode::Char('?') => KeyAction::CloseHelp,
-            _ => KeyAction::Ignore,
-        };
+    match shell.overlay {
+        Overlay::Help => {
+            return match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => KeyAction::CloseHelp,
+                _ => KeyAction::Ignore,
+            };
+        }
+        Overlay::RunComposer | Overlay::RunStatus => return route_run(key, ctrl),
+        Overlay::ContextMenu => return route_context_menu(key),
+        Overlay::None => {}
     }
 
     match shell.mode {
-        InteractionMode::Run => route_run(key, ctrl),
-        InteractionMode::EditRegion => route_edit_region(key),
-        InteractionMode::Select => route_select(key, ctrl),
-        InteractionMode::View => route_view(shell, key, ctrl, has_selection),
+        InteractionMode::EditRegion => route_edit_region(key, ctrl),
+        InteractionMode::Select => route_select(key, ctrl, can_run),
+        InteractionMode::Idle => route_idle(shell, key, ctrl, has_selection, can_run),
     }
 }
 
 fn route_run(key: KeyEvent, ctrl: bool) -> KeyAction {
     match key.code {
-        KeyCode::Esc => KeyAction::RestorePreviousMode,
+        KeyCode::Esc => KeyAction::CloseOverlay,
         KeyCode::Char('r') if ctrl => KeyAction::RunIgnore,
         _ => KeyAction::RunIgnore,
     }
 }
 
-fn route_edit_region(key: KeyEvent) -> KeyAction {
+fn route_context_menu(key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => KeyAction::CloseContextMenu,
+        KeyCode::Enter => KeyAction::ContextMenuApply,
+        KeyCode::Up | KeyCode::Char('k') => KeyAction::ContextMenuPrev,
+        KeyCode::Down | KeyCode::Char('j') => KeyAction::ContextMenuNext,
+        _ => KeyAction::Ignore,
+    }
+}
+
+fn route_edit_region(key: KeyEvent, ctrl: bool) -> KeyAction {
+    if key.code == KeyCode::Char('r') && ctrl {
+        return KeyAction::Ignore;
+    }
     match key.code {
         KeyCode::Esc => KeyAction::EditFormCancel,
         KeyCode::Enter => KeyAction::EditFormSave,
@@ -288,19 +393,22 @@ fn route_edit_region(key: KeyEvent) -> KeyAction {
     }
 }
 
-fn route_select(key: KeyEvent, ctrl: bool) -> KeyAction {
+fn route_select(key: KeyEvent, ctrl: bool, can_run: bool) -> KeyAction {
     if matches!(key.code, KeyCode::Tab) {
-        return KeyAction::CyclePaneNext;
+        return KeyAction::ExitSelectKeepThenCycleNext;
     }
     if matches!(key.code, KeyCode::BackTab) {
-        return KeyAction::CyclePanePrev;
+        return KeyAction::ExitSelectKeepThenCyclePrev;
     }
     if key.code == KeyCode::Char('r') && ctrl {
-        return KeyAction::Ignore;
+        return if can_run {
+            KeyAction::EnterRun
+        } else {
+            KeyAction::Ignore
+        };
     }
     match key.code {
-        KeyCode::Esc => KeyAction::RestorePreviousMode,
-        KeyCode::Char('f') => KeyAction::ToggleCollapse,
+        KeyCode::Esc => KeyAction::ClearSelection,
         KeyCode::Left | KeyCode::Char('h') => KeyAction::SeqCursor(-1),
         KeyCode::Right | KeyCode::Char('l') => KeyAction::SeqCursor(1),
         KeyCode::Char('H') => KeyAction::SeqExpandStart(1),
@@ -321,9 +429,13 @@ fn route_select(key: KeyEvent, ctrl: bool) -> KeyAction {
     }
 }
 
-fn route_view(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool) -> KeyAction {
+fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can_run: bool) -> KeyAction {
     if key.code == KeyCode::Char('r') && ctrl {
-        return KeyAction::EnterRun;
+        return if can_run {
+            KeyAction::EnterRun
+        } else {
+            KeyAction::Ignore
+        };
     }
     match key.code {
         KeyCode::Tab => KeyAction::CyclePaneNext,
@@ -331,11 +443,11 @@ fn route_view(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool) -> 
         KeyCode::Char('f') => KeyAction::ToggleCollapse,
         KeyCode::Char('q') => KeyAction::Quit,
         KeyCode::Char('c') if ctrl => KeyAction::Quit,
-        KeyCode::Char('x') => KeyAction::EnterSelect,
+        KeyCode::Char('x') if shell.editspec_focused() => KeyAction::EnterSelect,
         KeyCode::Enter if shell.tree_focused() => KeyAction::TreeActivate,
-        KeyCode::Enter => KeyAction::OpenEmptyForm,
-        KeyCode::Char('e') => KeyAction::EditFocusedRegion,
-        KeyCode::Esc if has_selection => KeyAction::ClearSelection,
+        KeyCode::Enter if shell.editspec_focused() => KeyAction::OpenEmptyForm,
+        KeyCode::Char('e') if shell.editspec_focused() => KeyAction::EditFocusedRegion,
+        KeyCode::Esc if has_selection && shell.editspec_focused() => KeyAction::ClearSelection,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
         KeyCode::Char('j') | KeyCode::Down => {
             if shell.tree_focused() {
@@ -519,6 +631,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
+    fn route(shell: &Shell, ev: KeyEvent) -> KeyAction {
+        route_key(shell, ev, false, true)
+    }
+
     #[test]
     fn pdb_session_collapses_tree_and_workflow() {
         let shell = Shell::pdb_session();
@@ -541,32 +657,39 @@ mod tests {
     #[test]
     fn tree_focus_enter_activates_row_not_editspec_form() {
         let mut shell = Shell::campaign_session();
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Enter), false, false),
-            KeyAction::TreeActivate
-        );
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('j')), false, false),
-            KeyAction::TreeNext
-        );
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('h')), false, false),
-            KeyAction::TreeCollapse
-        );
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::TreeActivate);
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::TreeNext);
+        assert_eq!(route(&shell, key(KeyCode::Char('h'))), KeyAction::TreeCollapse);
         shell.focus(PaneId::View);
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Enter), false, false),
-            KeyAction::OpenEmptyForm
-        );
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::Ignore);
+        shell.focus(PaneId::Workflow);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::Ignore);
+        assert_eq!(route(&shell, key(KeyCode::Char('x'))), KeyAction::Ignore);
+        assert_eq!(route(&shell, key(KeyCode::Char('e'))), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn view_enter_is_ignore() {
+        let shell = Shell::pdb_session();
+        assert_eq!(shell.focused, PaneId::View);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::Ignore);
+        assert_eq!(route(&shell, key(KeyCode::Char('x'))), KeyAction::Ignore);
+        assert_eq!(route(&shell, key(KeyCode::Char('e'))), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn editspec_enter_opens_empty_form() {
+        let mut shell = Shell::pdb_session();
+        shell.focus(PaneId::EditSpec);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::OpenEmptyForm);
+        assert_eq!(route(&shell, key(KeyCode::Char('x'))), KeyAction::EnterSelect);
+        assert_eq!(route(&shell, key(KeyCode::Char('e'))), KeyAction::EditFocusedRegion);
     }
 
     #[test]
     fn tab_cycles_exclusive_focus() {
         let mut shell = Shell::pdb_session();
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Tab), false, false),
-            KeyAction::CyclePaneNext
-        );
+        assert_eq!(route(&shell, key(KeyCode::Tab)), KeyAction::CyclePaneNext);
         shell.cycle_focus_next();
         assert_eq!(shell.focused, PaneId::EditSpec);
         shell.cycle_focus_next();
@@ -587,97 +710,141 @@ mod tests {
     #[test]
     fn view_jk_rotates_editspec_jk_navigates() {
         let view = Shell::pdb_session();
-        assert_eq!(
-            route_key(&view, key(KeyCode::Char('j')), false, false),
-            KeyAction::RotateX(1.0)
-        );
+        assert_eq!(route(&view, key(KeyCode::Char('j'))), KeyAction::RotateX(1.0));
         let mut editspec = Shell::pdb_session();
         editspec.focus(PaneId::EditSpec);
-        assert_eq!(
-            route_key(&editspec, key(KeyCode::Char('j')), false, false),
-            KeyAction::RegionNext
-        );
-        assert_eq!(
-            route_key(&editspec, key(KeyCode::Char('k')), false, false),
-            KeyAction::RegionPrev
-        );
+        assert_eq!(route(&editspec, key(KeyCode::Char('j'))), KeyAction::RegionNext);
+        assert_eq!(route(&editspec, key(KeyCode::Char('k'))), KeyAction::RegionPrev);
     }
 
     #[test]
     fn view_mode_does_not_steal_3d_keys_for_sequence() {
         let shell = Shell::pdb_session();
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('h')), false, false),
-            KeyAction::RotateY(-1.0)
-        );
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('l')), false, false),
-            KeyAction::RotateY(1.0)
-        );
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('w')), false, false),
-            KeyAction::Pan(0.0, 1.0)
-        );
+        assert_eq!(route(&shell, key(KeyCode::Char('h'))), KeyAction::RotateY(-1.0));
+        assert_eq!(route(&shell, key(KeyCode::Char('l'))), KeyAction::RotateY(1.0));
+        assert_eq!(route(&shell, key(KeyCode::Char('w'))), KeyAction::Pan(0.0, 1.0));
     }
 
     #[test]
     fn x_enters_select_and_select_owns_hl() {
         let mut shell = Shell::pdb_session();
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('x')), false, false),
-            KeyAction::EnterSelect
-        );
+        shell.focus(PaneId::EditSpec);
+        assert_eq!(route(&shell, key(KeyCode::Char('x'))), KeyAction::EnterSelect);
         shell.enter_mode(InteractionMode::Select);
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('h')), false, false),
-            KeyAction::SeqCursor(-1)
-        );
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Char('q')), false, false),
-            KeyAction::Ignore
-        );
+        assert_eq!(route(&shell, key(KeyCode::Char('h'))), KeyAction::SeqCursor(-1));
+        assert_eq!(route(&shell, key(KeyCode::Char('q'))), KeyAction::Ignore);
     }
 
     #[test]
-    fn q_quits_only_in_view() {
+    fn q_quits_only_when_idle() {
         let view = Shell::pdb_session();
-        assert_eq!(
-            route_key(&view, key(KeyCode::Char('q')), false, false),
-            KeyAction::Quit
-        );
+        assert_eq!(route(&view, key(KeyCode::Char('q'))), KeyAction::Quit);
         let mut select = Shell::pdb_session();
         select.enter_mode(InteractionMode::Select);
-        assert_ne!(
-            route_key(&select, key(KeyCode::Char('q')), false, false),
-            KeyAction::Quit
-        );
+        assert_ne!(route(&select, key(KeyCode::Char('q'))), KeyAction::Quit);
         let mut run = Shell::pdb_session();
-        run.enter_mode(InteractionMode::Run);
-        assert_ne!(
-            route_key(&run, key(KeyCode::Char('q')), false, false),
-            KeyAction::Quit
-        );
+        run.open_overlay(Overlay::RunComposer);
+        assert_ne!(route(&run, key(KeyCode::Char('q'))), KeyAction::Quit);
+        let mut form = Shell::pdb_session();
+        form.enter_mode(InteractionMode::EditRegion);
+        assert_ne!(route(&form, key(KeyCode::Char('q'))), KeyAction::Quit);
     }
 
     #[test]
-    fn ctrl_r_opens_run_only_from_view() {
+    fn ctrl_r_opens_composer_from_any_pane_including_select() {
         let view = Shell::pdb_session();
+        assert_eq!(route(&view, key_ctrl(KeyCode::Char('r'))), KeyAction::EnterRun);
+        let mut select = Shell::pdb_session();
+        select.focus(PaneId::EditSpec);
+        select.enter_mode(InteractionMode::Select);
+        assert_eq!(route(&select, key_ctrl(KeyCode::Char('r'))), KeyAction::EnterRun);
+        let mut tree = Shell::pdb_session();
+        tree.focus(PaneId::Tree);
+        assert_eq!(route(&tree, key_ctrl(KeyCode::Char('r'))), KeyAction::EnterRun);
+        let mut run = Shell::pdb_session();
+        run.open_overlay(Overlay::RunComposer);
+        assert_eq!(route(&run, key_ctrl(KeyCode::Char('r'))), KeyAction::RunIgnore);
+        let mut form = Shell::pdb_session();
+        form.enter_mode(InteractionMode::EditRegion);
+        assert_eq!(route(&form, key_ctrl(KeyCode::Char('r'))), KeyAction::Ignore);
         assert_eq!(
             route_key(&view, key_ctrl(KeyCode::Char('r')), false, false),
-            KeyAction::EnterRun
-        );
-        let mut select = Shell::pdb_session();
-        select.enter_mode(InteractionMode::Select);
-        assert_eq!(
-            route_key(&select, key_ctrl(KeyCode::Char('r')), false, false),
             KeyAction::Ignore
         );
-        let mut run = Shell::pdb_session();
-        run.enter_mode(InteractionMode::Run);
+    }
+
+    #[test]
+    fn select_esc_clears_and_returns_editspec_idle() {
+        let mut shell = Shell::pdb_session();
+        shell.focus(PaneId::EditSpec);
+        shell.enter_mode(InteractionMode::Select);
+        assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::ClearSelection);
+        shell.enter_idle();
+        assert_eq!(shell.focused, PaneId::EditSpec);
+        assert_eq!(shell.mode, InteractionMode::Idle);
+        assert!(shell.session_idle());
+    }
+
+    #[test]
+    fn select_tab_exits_keep_then_cycles() {
+        let mut shell = Shell::pdb_session();
+        shell.focus(PaneId::EditSpec);
+        shell.enter_mode(InteractionMode::Select);
         assert_eq!(
-            route_key(&run, key_ctrl(KeyCode::Char('r')), false, false),
-            KeyAction::RunIgnore
+            route(&shell, key(KeyCode::Tab)),
+            KeyAction::ExitSelectKeepThenCycleNext
         );
+        shell.exit_select_keep_then_cycle(true);
+        assert_eq!(shell.mode, InteractionMode::Idle);
+        assert_ne!(shell.focused, PaneId::EditSpec);
+    }
+
+    #[test]
+    fn pointer_from_select_to_view_idles_keep_focus_view() {
+        let mut shell = Shell::pdb_session();
+        shell.focus(PaneId::EditSpec);
+        shell.enter_mode(InteractionMode::Select);
+        shell.pointer_leave_local_mode();
+        shell.focus(PaneId::View);
+        assert_eq!(shell.focused, PaneId::View);
+        assert_eq!(shell.mode, InteractionMode::Idle);
+    }
+
+    #[test]
+    fn pointer_from_form_opened_in_select_idles_not_restore_select() {
+        let mut shell = Shell::pdb_session();
+        shell.focus(PaneId::EditSpec);
+        shell.enter_mode(InteractionMode::Select);
+        shell.enter_mode(InteractionMode::EditRegion);
+        assert_eq!(shell.previous_mode, InteractionMode::Select);
+        shell.pointer_leave_local_mode();
+        shell.focus(PaneId::View);
+        assert_eq!(shell.focused, PaneId::View);
+        assert_eq!(shell.mode, InteractionMode::Idle);
+        assert_ne!(shell.mode, InteractionMode::Select);
+    }
+
+    #[test]
+    fn context_menu_owns_jk_enter_esc() {
+        let mut shell = Shell::pdb_session();
+        shell.open_overlay(Overlay::ContextMenu);
+        assert_eq!(route(&shell, key(KeyCode::Char('j'))), KeyAction::ContextMenuNext);
+        assert_eq!(route(&shell, key(KeyCode::Char('k'))), KeyAction::ContextMenuPrev);
+        assert_eq!(route(&shell, key(KeyCode::Enter)), KeyAction::ContextMenuApply);
+        assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::CloseContextMenu);
+        assert_eq!(route(&shell, key(KeyCode::Char('q'))), KeyAction::Ignore);
+    }
+
+    #[test]
+    fn help_and_composer_do_not_stack() {
+        let mut shell = Shell::pdb_session();
+        shell.open_overlay(Overlay::RunComposer);
+        assert_eq!(route(&shell, key(KeyCode::Char('?'))), KeyAction::RunIgnore);
+        shell.close_overlay();
+        assert_eq!(route(&shell, key(KeyCode::Char('?'))), KeyAction::ToggleHelp);
+        shell.open_overlay(Overlay::Help);
+        shell.open_overlay(Overlay::RunComposer);
+        assert_eq!(shell.overlay, Overlay::Help);
     }
 
     #[test]
@@ -685,10 +852,7 @@ mod tests {
         let mut shell = Shell::pdb_session();
         shell.enter_mode(InteractionMode::Select);
         shell.enter_mode(InteractionMode::EditRegion);
-        assert_eq!(
-            route_key(&shell, key(KeyCode::Esc), false, false),
-            KeyAction::EditFormCancel
-        );
+        assert_eq!(route(&shell, key(KeyCode::Esc)), KeyAction::EditFormCancel);
         shell.restore_previous_mode();
         assert_eq!(shell.mode, InteractionMode::Select);
     }
