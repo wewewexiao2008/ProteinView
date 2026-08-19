@@ -1087,7 +1087,13 @@ fn main() -> Result<()> {
                 ])
                 .split(frame.area());
 
-            ui::header::render_header(frame, outer[0], &app.protein.name, app.python_available);
+            ui::header::render_header(
+                frame,
+                outer[0],
+                &app.protein.name,
+                app.python_available,
+                app.debug,
+            );
 
             let chrome = ui::chrome::split_chrome(outer[1], &app.shell, app.layout_mode);
             app.last_workflow_rect = Some(chrome.workflow);

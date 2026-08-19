@@ -14,6 +14,12 @@ const EDITSPEC_STRIP: u16 = 10;
 const VIEW_STRIP: u16 = 10;
 const FOLD_COLS: u16 = 3;
 
+/// Session chrome for the campaign Debug bit. Not a fifth `PaneId`; it sits in
+/// the header next to `[Read-only]` so `D` has something visible to flip.
+pub fn debug_badge(debug: bool) -> Option<&'static str> {
+    if debug { Some(" [Debug]") } else { None }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeDrag {
     WorkflowHeight,
@@ -366,6 +372,12 @@ mod tests {
         let shell = Shell::campaign_session();
         let rects = split_chrome(Rect::new(0, 0, 120, 40), &shell, LayoutMode::Horizontal);
         (shell, rects)
+    }
+
+    #[test]
+    fn debug_badge_follows_the_state_bit() {
+        assert_eq!(debug_badge(true), Some(" [Debug]"));
+        assert_eq!(debug_badge(false), None);
     }
 
     #[test]

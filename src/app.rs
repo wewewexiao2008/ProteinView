@@ -1486,37 +1486,57 @@ impl App {
     }
 
     pub fn toggle_debug_mode(&mut self) {
-        let Some(root) = self.campaign_root.as_deref() else {
+        if self.campaign_root.is_none() {
             self.status_banner = Some("PDB 会话不能开 Debug".to_string());
             return;
-        };
-        let marker = std::path::Path::new(root).join("debug.json");
-        if self.debug {
-            let _ = std::fs::remove_file(&marker);
-            self.debug = false;
-            self.emit(
-                EventLevel::Session,
-                EventPane::None,
-                "session.debug_off",
-                false,
-                "Debug off",
-                None,
-            );
-        } else {
-            let _ = std::fs::write(&marker, "{\"debug\": true}\n");
-            self.debug = true;
-            self.emit(
-                EventLevel::Session,
-                EventPane::None,
-                "session.debug_on",
-                false,
-                "Debug on",
-                None,
-            );
         }
+        let want = !self.debug;
+        if let Err(err) = self.spawn_studio_debug(want) {
+            self.status_banner = Some(err);
+            return;
+        }
+        // Do not mirror the bit here. gemlib re-seeds the state file and the
+        // next poll applies it, so the badge can never claim a state the
+        // marker does not have.
+        self.emit(
+            EventLevel::Session,
+            EventPane::None,
+            if want {
+                "session.debug_on"
+            } else {
+                "session.debug_off"
+            },
+            false,
+            if want { "Debug on" } else { "Debug off" },
+            None,
+        );
+    }
+
+    fn spawn_studio_debug(&self, on: bool) -> Result<(), String> {
+        let root = self
+            .campaign_root
+            .as_deref()
+            .ok_or_else(|| "PDB 会话不能开 Debug".to_string())?;
+        let bin = self
+            .gemlib_bin
+            .as_deref()
+            .ok_or_else(|| "缺少 gemlib-bin".to_string())?;
+        let argv = crate::debug_run::studio_debug_argv(bin, root, on);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if let Some(state) = &self.state_file {
+            cmd.env("GEMLIB_STUDIO_STATE", state);
+        }
+        cmd.spawn().map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     pub fn cycle_run_priority(&mut self) {
+        // Debug on means Enter goes to Debug Run, so the lane and quota fields
+        // are not on screen. Leave them alone instead of editing a hidden form.
+        if self.debug {
+            return;
+        }
         self.run_priority = if self.run_priority == "fast" {
             "slow".to_string()
         } else {
@@ -1525,6 +1545,9 @@ impl App {
     }
 
     pub fn bump_run_concurrency(&mut self, delta: i32) {
+        if self.debug {
+            return;
+        }
         let next = self.run_concurrency as i32 + delta;
         self.run_concurrency = next.max(1) as u32;
     }
@@ -1561,6 +1584,12 @@ impl App {
             .ok_or_else(|| "缺少 campaign".to_string())?;
         if std::path::Path::new(root).join("debug.json").is_file() {
             return Err("debug campaign 不能投 Fleet".to_string());
+        }
+        // The planner resolves the recipe itself, so it stays out of argv. Without
+        // this check a recipe-less campaign detaches a child that dies unseen,
+        // while Debug Run would have said so up front.
+        if crate::debug_run::campaign_recipe_path(root).is_none() {
+            return Err("campaign 里没有 run.yaml".to_string());
         }
         let argv = crate::debug_run::fleet_schedule_argv(
             bin,
@@ -4499,5 +4528,92 @@ mod tests {
         assert!(hidden.iter().all(|event| event.op != "view.camera"));
         let shown = app.event_log.visible(true);
         assert!(shown.iter().any(|event| event.op == "view.camera"));
+    }
+
+    fn fleet_scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pv-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn fleet_submit_refuses_a_recipe_less_campaign_like_debug_run_does() {
+        let root = fleet_scratch("fleet-norecipe");
+        let mut app = test_app();
+        app.campaign_root = Some(root.display().to_string());
+        app.gemlib_bin = Some("/nonexistent/gemlib".to_string());
+
+        app.confirm_debug_run();
+
+        assert_eq!(
+            app.status_banner.as_deref(),
+            Some("campaign 里没有 run.yaml")
+        );
+        assert!(
+            app.event_log
+                .events()
+                .iter()
+                .all(|event| event.op != "run.fleet_start")
+        );
+
+        // With a recipe the guard is past: the banner now comes from spawning the
+        // bogus binary, not from the recipe check.
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(root.join("config/run.yaml"), "compose: []\n").unwrap();
+        app.status_banner = None;
+        app.confirm_debug_run();
+        let banner = app.status_banner.clone().expect("spawn error banner");
+        assert!(!banner.contains("run.yaml"), "{banner}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn debug_toggle_execs_gemlib_and_never_writes_the_marker() {
+        let root = fleet_scratch("debug-toggle");
+        let marker = root.join("debug.json");
+        let mut app = test_app();
+        app.campaign_root = Some(root.display().to_string());
+        app.gemlib_bin = Some("/nonexistent/gemlib".to_string());
+
+        app.toggle_debug_mode();
+
+        // Studio must not own the marker, and must not claim a bit the file
+        // does not have. gemlib re-seeds; the next poll applies it.
+        assert!(!marker.exists());
+        assert!(!app.debug);
+
+        let mut pdb = test_app();
+        pdb.toggle_debug_mode();
+        assert_eq!(
+            pdb.status_banner.as_deref(),
+            Some("PDB 会话不能开 Debug")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lane_and_quota_keys_are_frozen_while_debug_is_on() {
+        let mut app = test_app();
+        app.debug = true;
+        app.cycle_run_priority();
+        app.bump_run_concurrency(3);
+        assert_eq!(app.run_priority, "fast");
+        assert_eq!(app.run_concurrency, 4);
+
+        app.debug = false;
+        app.cycle_run_priority();
+        app.bump_run_concurrency(3);
+        assert_eq!(app.run_priority, "slow");
+        assert_eq!(app.run_concurrency, 7);
+        app.bump_run_concurrency(-100);
+        assert_eq!(app.run_concurrency, 1);
     }
 }

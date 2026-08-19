@@ -5,12 +5,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 /// Render the retro-styled header with protein name and Python bridge status.
-pub fn render_header(frame: &mut Frame, area: Rect, protein_name: &str, python_available: bool) {
+pub fn render_header(
+    frame: &mut Frame,
+    area: Rect,
+    protein_name: &str,
+    python_available: bool,
+    debug: bool,
+) {
     let title_text = format!(" ProteinView ─── {} ", protein_name);
 
     // Build the right-side indicator showing bridge status.
     let mode_label = if python_available { "" } else { " [Read-only]" };
-    let mode_len = mode_label.len();
+    let debug_label = crate::ui::chrome::debug_badge(debug).unwrap_or("");
+    let mode_len = mode_label.len() + debug_label.len();
 
     let fill_len = (area.width as usize).saturating_sub(title_text.len() + 4 + mode_len) / 2;
     let fill = " ─".repeat(fill_len);
@@ -32,6 +39,15 @@ pub fn render_header(frame: &mut Frame, area: Rect, protein_name: &str, python_a
         spans.push(Span::styled(
             " [Read-only]",
             Style::default().fg(Color::Rgb(255, 165, 0)),
+        ));
+    }
+
+    if !debug_label.is_empty() {
+        spans.push(Span::styled(
+            debug_label,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 

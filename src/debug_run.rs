@@ -32,6 +32,21 @@ pub fn fleet_schedule_argv(
     ]
 }
 
+/// Flip the campaign Debug marker through gemlib.
+///
+/// `debug.json` is owned by `gemlib.pipeline.debug_run`; Studio writing it
+/// directly would make two owners, and a swallowed write error would leave the
+/// corner badge disagreeing with the file. gemlib re-seeds the state file, so
+/// the next poll brings the real bit back.
+pub fn studio_debug_argv(gemlib_bin: &str, campaign: &str, on: bool) -> Vec<String> {
+    vec![
+        gemlib_bin.to_string(),
+        "studio-debug".to_string(),
+        campaign.to_string(),
+        if on { "--on" } else { "--off" }.to_string(),
+    ]
+}
+
 pub fn debug_run_argv(gemlib_bin: &str, recipe: &str, campaign: &str) -> Vec<String> {
     vec![
         gemlib_bin.to_string(),
@@ -106,6 +121,18 @@ pub fn last_console_hint(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn studio_debug_argv_execs_gemlib_instead_of_writing_the_marker() {
+        assert_eq!(
+            studio_debug_argv("/tmp/gemlib", "/tmp/camp", true),
+            vec!["/tmp/gemlib", "studio-debug", "/tmp/camp", "--on"]
+        );
+        assert_eq!(
+            studio_debug_argv("/tmp/gemlib", "/tmp/camp", false),
+            vec!["/tmp/gemlib", "studio-debug", "/tmp/camp", "--off"]
+        );
+    }
 
     #[test]
     fn fleet_schedule_argv_uses_priority_and_concurrency() {
