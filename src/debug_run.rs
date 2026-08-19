@@ -13,6 +13,25 @@ pub fn campaign_recipe_path(campaign: &str) -> Option<String> {
     None
 }
 
+pub fn fleet_schedule_argv(
+    gemlib_bin: &str,
+    campaign: &str,
+    priority: &str,
+    concurrency: u32,
+) -> Vec<String> {
+    vec![
+        gemlib_bin.to_string(),
+        "fleet".to_string(),
+        "schedule".to_string(),
+        "-o".to_string(),
+        campaign.to_string(),
+        "--priority".to_string(),
+        priority.to_string(),
+        "--concurrency".to_string(),
+        concurrency.to_string(),
+    ]
+}
+
 pub fn debug_run_argv(gemlib_bin: &str, recipe: &str, campaign: &str) -> Vec<String> {
     vec![
         gemlib_bin.to_string(),
@@ -87,6 +106,25 @@ pub fn last_console_hint(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_schedule_argv_uses_priority_and_concurrency() {
+        let argv = fleet_schedule_argv("/tmp/gemlib", "/tmp/camp", "fast", 4);
+        assert_eq!(
+            argv,
+            vec![
+                "/tmp/gemlib",
+                "fleet",
+                "schedule",
+                "-o",
+                "/tmp/camp",
+                "--priority",
+                "fast",
+                "--concurrency",
+                "4"
+            ]
+        );
+    }
 
     #[test]
     fn debug_run_argv_uses_pipeline_run_debug() {

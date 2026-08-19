@@ -132,6 +132,9 @@ fn apply_key_action(
         }
         KeyAction::EnterRun => app.enter_run_mode(),
         KeyAction::ConfirmDebugRun => app.confirm_debug_run(),
+        KeyAction::ToggleDebug => app.toggle_debug_mode(),
+        KeyAction::RunCycleLane => app.cycle_run_priority(),
+        KeyAction::RunConcurrency(delta) => app.bump_run_concurrency(delta),
         KeyAction::OpenEmptyForm => app.edit_region_open_empty(),
         KeyAction::EditFocusedRegion => app.edit_region_start(),
         KeyAction::ClearSelection => app.clear_editspec_selection(),
@@ -1121,7 +1124,7 @@ fn main() -> Result<()> {
 
             match app.shell.overlay {
                 Overlay::RunComposer | Overlay::RunStatus => {
-                    ui::run_overlay::render_run_overlay(frame, frame.area());
+                    ui::run_overlay::render_run_overlay(frame, frame.area(), &app);
                 }
                 Overlay::Help => {
                     ui::help_overlay::render_help_overlay(frame, frame.area());

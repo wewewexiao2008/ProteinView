@@ -90,6 +90,9 @@ pub enum KeyAction {
     EnterSelect,
     EnterRun,
     ConfirmDebugRun,
+    ToggleDebug,
+    RunCycleLane,
+    RunConcurrency(i32),
     OpenEmptyForm,
     EditFocusedRegion,
     ExitSelectKeepThenCycleNext,
@@ -408,6 +411,10 @@ fn route_run(key: KeyEvent, ctrl: bool) -> KeyAction {
     match key.code {
         KeyCode::Esc => KeyAction::CloseOverlay,
         KeyCode::Enter => KeyAction::ConfirmDebugRun,
+        KeyCode::Left | KeyCode::Char('h') => KeyAction::RunCycleLane,
+        KeyCode::Right | KeyCode::Char('l') => KeyAction::RunCycleLane,
+        KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::RunConcurrency(1),
+        KeyCode::Char('-') => KeyAction::RunConcurrency(-1),
         KeyCode::Char('r') if ctrl => KeyAction::RunIgnore,
         _ => KeyAction::RunIgnore,
     }
@@ -578,6 +585,7 @@ fn route_idle(shell: &Shell, key: KeyEvent, ctrl: bool, has_selection: bool, can
         KeyCode::Char('r') if shell.view_focused() => KeyAction::ResetCamera,
         KeyCode::Char('c') => KeyAction::ToggleConsole,
         KeyCode::Char('C') => KeyAction::CycleColor,
+        KeyCode::Char('D') => KeyAction::ToggleDebug,
         KeyCode::Char('v') => KeyAction::CycleViz,
         KeyCode::Char('m') => KeyAction::ToggleHd,
         KeyCode::Char('M') => KeyAction::ToggleFullHd,
@@ -834,6 +842,8 @@ mod tests {
         let mut run = Shell::pdb_session();
         run.open_overlay(Overlay::RunComposer);
         assert_eq!(route(&run, key(KeyCode::Enter)), KeyAction::ConfirmDebugRun);
+        assert_eq!(route(&run, key(KeyCode::Char('h'))), KeyAction::RunCycleLane);
+        assert_eq!(route(&run, key(KeyCode::Char('+'))), KeyAction::RunConcurrency(1));
         assert_eq!(route(&run, key_ctrl(KeyCode::Char('r'))), KeyAction::RunIgnore);
         let mut form = Shell::pdb_session();
         form.enter_mode(InteractionMode::EditRegion);
@@ -971,6 +981,7 @@ mod tests {
         let view = Shell::pdb_session();
         assert_eq!(route(&view, key(KeyCode::Char('c'))), KeyAction::ToggleConsole);
         assert_eq!(route(&view, key(KeyCode::Char('C'))), KeyAction::CycleColor);
+        assert_eq!(route(&view, key(KeyCode::Char('D'))), KeyAction::ToggleDebug);
         assert_eq!(route(&view, key(KeyCode::Tab)), KeyAction::CyclePaneNext);
     }
 

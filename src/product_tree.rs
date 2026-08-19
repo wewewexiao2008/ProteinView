@@ -20,6 +20,8 @@ pub struct StudioSeed {
     pub workflow_graph: Option<serde_json::Value>,
     #[serde(default)]
     pub edit_spec: Option<String>,
+    #[serde(default)]
+    pub debug: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

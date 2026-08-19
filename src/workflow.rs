@@ -64,6 +64,10 @@ pub struct WorkflowStatus {
     pub edit_spec: String,
     #[serde(default)]
     pub draft: bool,
+    #[serde(default)]
+    pub running_on: Vec<String>,
+    #[serde(default)]
+    pub queued: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

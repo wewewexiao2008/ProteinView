@@ -733,6 +733,9 @@ pub struct App {
     pub workflow_drag: Option<usize>,
     pub block_palette: Option<BlockPalette>,
     pub campaign_root: Option<String>,
+    pub debug: bool,
+    pub run_priority: String,
+    pub run_concurrency: u32,
     pub loaded_structure_path: Option<String>,
     pub state_file: Option<String>,
     pub state_mtime: Option<std::time::SystemTime>,
@@ -972,6 +975,9 @@ impl App {
             workflow_drag: None,
             block_palette: None,
             campaign_root: None,
+            debug: false,
+            run_priority: "fast".to_string(),
+            run_concurrency: 4,
             loaded_structure_path: None,
             state_file: None,
             state_mtime: None,
@@ -995,6 +1001,7 @@ impl App {
         self.workflow_status = seed.workflow_status;
         self.workflow_error = seed.workflow_error;
         self.workflow_graph = seed.workflow_graph;
+        self.debug = seed.debug;
         if first_seed {
             self.tree_cursor = 0;
             self.tree_scroll = 0;
@@ -1437,15 +1444,38 @@ impl App {
 
     pub fn confirm_debug_run(&mut self) {
         self.close_run_overlay();
-        match self.spawn_debug_run() {
+        if self.campaign_root.is_none() {
+            self.status_banner = Some("PDB 会话不能投 Fleet".to_string());
+            return;
+        }
+        if self.debug {
+            match self.spawn_debug_run() {
+                Ok(()) => {
+                    self.console_open = true;
+                    self.emit(
+                        EventLevel::Run,
+                        EventPane::None,
+                        "run.debug_start",
+                        false,
+                        "waiting debug … (3s)",
+                        None,
+                    );
+                }
+                Err(err) => {
+                    self.status_banner = Some(err);
+                }
+            }
+            return;
+        }
+        match self.spawn_fleet_schedule() {
             Ok(()) => {
                 self.console_open = true;
                 self.emit(
                     EventLevel::Run,
                     EventPane::None,
-                    "run.debug_start",
+                    "run.fleet_start",
                     false,
-                    "waiting debug … (3s)",
+                    "queued / running on …",
                     None,
                 );
             }
@@ -1453,6 +1483,50 @@ impl App {
                 self.status_banner = Some(err);
             }
         }
+    }
+
+    pub fn toggle_debug_mode(&mut self) {
+        let Some(root) = self.campaign_root.as_deref() else {
+            self.status_banner = Some("PDB 会话不能开 Debug".to_string());
+            return;
+        };
+        let marker = std::path::Path::new(root).join("debug.json");
+        if self.debug {
+            let _ = std::fs::remove_file(&marker);
+            self.debug = false;
+            self.emit(
+                EventLevel::Session,
+                EventPane::None,
+                "session.debug_off",
+                false,
+                "Debug off",
+                None,
+            );
+        } else {
+            let _ = std::fs::write(&marker, "{\"debug\": true}\n");
+            self.debug = true;
+            self.emit(
+                EventLevel::Session,
+                EventPane::None,
+                "session.debug_on",
+                false,
+                "Debug on",
+                None,
+            );
+        }
+    }
+
+    pub fn cycle_run_priority(&mut self) {
+        self.run_priority = if self.run_priority == "fast" {
+            "slow".to_string()
+        } else {
+            "fast".to_string()
+        };
+    }
+
+    pub fn bump_run_concurrency(&mut self, delta: i32) {
+        let next = self.run_concurrency as i32 + delta;
+        self.run_concurrency = next.max(1) as u32;
     }
 
     fn spawn_debug_run(&self) -> Result<(), String> {
@@ -1467,6 +1541,33 @@ impl App {
         let recipe = crate::debug_run::campaign_recipe_path(root)
             .ok_or_else(|| "campaign 里没有 run.yaml".to_string())?;
         let argv = crate::debug_run::debug_run_argv(bin, &recipe, root);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        if let Some(state) = &self.state_file {
+            cmd.env("GEMLIB_STUDIO_STATE", state);
+        }
+        cmd.spawn().map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn spawn_fleet_schedule(&self) -> Result<(), String> {
+        let bin = self
+            .gemlib_bin
+            .as_deref()
+            .ok_or_else(|| "缺少 gemlib-bin".to_string())?;
+        let root = self
+            .campaign_root
+            .as_deref()
+            .ok_or_else(|| "缺少 campaign".to_string())?;
+        if std::path::Path::new(root).join("debug.json").is_file() {
+            return Err("debug campaign 不能投 Fleet".to_string());
+        }
+        let argv = crate::debug_run::fleet_schedule_argv(
+            bin,
+            root,
+            &self.run_priority,
+            self.run_concurrency,
+        );
         let mut cmd = std::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
         if let Some(state) = &self.state_file {
@@ -4279,6 +4380,8 @@ mod tests {
             can_run: true,
             edit_spec: String::new(),
             draft: false,
+            running_on: Vec::new(),
+            queued: 0,
         });
         app.workflow_graph = Some(serde_json::json!({
             "compose": [

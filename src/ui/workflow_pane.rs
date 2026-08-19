@@ -68,6 +68,12 @@ pub fn render_workflow_pane(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         header.push_str("cannot run");
     }
+    if !status.running_on.is_empty() {
+        header.push_str("  running on ");
+        header.push_str(&status.running_on.join(", "));
+    } else if status.queued > 0 {
+        header.push_str("  queued");
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             truncate_line(&format!(" {header}"), inner.width),
